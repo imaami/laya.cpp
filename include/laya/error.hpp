@@ -6,8 +6,7 @@
 
 namespace laya {
 // Error categories. Transport layers map them to statuses; the CLI prints the
-// message. Laya code is built without exceptions, so every fallible operation
-// returns result<T>.
+// message. Laya is built without exceptions: fallible operations return result<T>.
 enum class errc : std::uint8_t {
     parse,        // malformed JSON text
     invalid,      // request violates the typed-decision protocol
@@ -36,3 +35,11 @@ using result = std::expected<T, error>;
     return code == errc::parse || code == errc::invalid || code == errc::too_large;
 }
 }
+
+// Declares `name` as the result of an expression and returns its error, if any.
+#define LAYA_TRY(name, ...) \
+    auto name = (__VA_ARGS__); \
+    if (!name) return std::unexpected(std::move(name).error())
+// Returns the error of a result<void> expression, if any.
+#define LAYA_CHECK(...) \
+    if (auto laya_status_ = (__VA_ARGS__); !laya_status_) return std::unexpected(std::move(laya_status_).error())
