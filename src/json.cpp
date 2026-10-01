@@ -1,17 +1,66 @@
 #include "laya/json.hpp"
 #include <fstream>
 #include <iterator>
+#include <utility>
+#include <vector>
 
 namespace laya {
 namespace {
-// json::parse, with syntax errors reported as values instead of exceptions.
-struct document_parser : nlohmann::detail::json_sax_dom_parser<json> {
-    using json_sax_dom_parser::json_sax_dom_parser;
-    std::string message;
-    template<class Exception> bool parse_error(std::size_t, const std::string&, const Exception& failure) {
+// Builds the document json::parse would, through nlohmann's public SAX
+// interface, and reports syntax errors as values instead of exceptions. Like
+// json::parse, a repeated object key keeps its first position and takes its
+// last value.
+class document_builder {
+public:
+    explicit document_builder(json& root) noexcept : root_(root) {}
+
+    bool null() { return value(nullptr); }
+    bool boolean(bool x) { return value(x); }
+    bool number_integer(json::number_integer_t x) { return value(x); }
+    bool number_unsigned(json::number_unsigned_t x) { return value(x); }
+    bool number_float(json::number_float_t x, const json::string_t&) { return value(x); }
+    // The parser hands over its token buffer, so strings move into the document.
+    bool string(json::string_t& x) { return value(std::move(x)); }
+    bool binary(json::binary_t& x) { return value(std::move(x)); }
+    bool start_object(std::size_t) { return open(json::object()); }
+    bool start_array(std::size_t) { return open(json::array()); }
+    bool end_object() { return close(); }
+    bool end_array() { return close(); }
+    bool key(json::string_t& name) {
+        member_ = &(*open_.back())[std::move(name)];
+        return true;
+    }
+    bool parse_error(std::size_t, const std::string&, const json::exception& failure) {
         message = failure.what();
         return false;
     }
+
+    std::string message;
+
+private:
+    template<class Value> json& insert(Value&& x) {
+        if (open_.empty()) return root_ = json(std::forward<Value>(x));
+        json& container = *open_.back();
+        if (container.is_object()) return *member_ = json(std::forward<Value>(x));
+        container.push_back(json(std::forward<Value>(x)));
+        return container.back();
+    }
+    template<class Value> bool value(Value&& x) {
+        insert(std::forward<Value>(x));
+        return true;
+    }
+    bool open(json container) {
+        open_.push_back(&insert(std::move(container)));
+        return true;
+    }
+    bool close() {
+        open_.pop_back();
+        return true;
+    }
+
+    json& root_;
+    std::vector<json*> open_;  // containers still being filled, innermost last
+    json* member_ = nullptr;   // the object member the next value fills
 };
 
 std::string type_error(int id, std::string_view text) {
@@ -21,8 +70,8 @@ std::string type_error(int id, std::string_view text) {
 
 result<json> parse_json(std::string_view text) {
     json value;
-    document_parser parser(value, false);
-    if (!json::sax_parse(text, &parser)) return fail(errc::parse, std::move(parser.message));
+    document_builder builder(value);
+    if (!json::sax_parse(text, &builder)) return fail(errc::parse, std::move(builder.message));
     return value;
 }
 
