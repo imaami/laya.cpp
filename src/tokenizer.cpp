@@ -21,6 +21,7 @@ struct string_hash {
 template<class T> using string_map = std::unordered_map<std::string, T, string_hash, std::equal_to<>>;
 
 constexpr std::uint64_t pair_key(token first, token second) { return std::uint64_t(std::uint32_t(first)) << 32 | std::uint32_t(second); }
+constexpr token missing = -1;  // a byte without a symbol in the vocabulary
 
 std::string utf8(UChar32 codepoint) {
     char buffer[U8_MAX_LENGTH];
@@ -49,7 +50,7 @@ template<class F, class Model>
 concept family = requires(const F& f, const Model& m, std::string_view text, std::string& normal, tokens& out) {
     { f.normalize(text, normal) } -> std::same_as<result<void>>;
     { f.words(m, text, out) } -> std::same_as<result<void>>;
-    f.symbols(m, text, out);
+    { f.symbols(m, text, out) } -> std::same_as<bool>;
 };
 
 // NFC normalization and the GPT-2 byte-level pre-tokenizer (English models).
@@ -69,13 +70,14 @@ struct byte_level {
         UErrorCode status = U_ZERO_ERROR;
         const auto input = icu::UnicodeString::fromUTF8(icu::StringPiece(text.data(), std::int32_t(text.size())));
         matcher->reset(input);  // the matcher reads `input` in place
-        for (std::string word; matcher->find(status); word.clear()) model.merge(*this, matcher->group(status).toUTF8String(word), out);
+        for (std::string word; matcher->find(status); word.clear()) LAYA_CHECK(model.merge(*this, matcher->group(status).toUTF8String(word), out));
         if (U_FAILURE(status)) return fail(errc::invalid, "Unicode tokenization failed");
         return {};
     }
-    void symbols(const auto&, std::string_view word, tokens& out) const {
+    bool symbols(const auto&, std::string_view word, tokens& out) const {
         out.reserve(word.size());
         for (const unsigned char byte : word) out.push_back(bytes[byte]);
+        return std::ranges::find(out, missing) == out.end();
     }
 };
 
@@ -93,11 +95,11 @@ struct metaspace {
         const std::string value = (text.starts_with(metaspace_mark) ? "" : metaspace_symbol) + std::string(text);
         for (std::size_t begin = 0, end; begin < value.size(); begin = end) {
             end = std::min(value.find(metaspace_mark, begin + metaspace_mark.size()), value.size());
-            model.merge(*this, std::string_view(value).substr(begin, end - begin), out);
+            LAYA_CHECK(model.merge(*this, std::string_view(value).substr(begin, end - begin), out));
         }
         return {};
     }
-    void symbols(const auto& model, std::string_view word, tokens& out) const {
+    bool symbols(const auto& model, std::string_view word, tokens& out) const {
         for (std::int32_t at = 0, size = std::int32_t(word.size()); at < size;) {
             const std::int32_t start = at;
             UChar32 codepoint;
@@ -106,6 +108,7 @@ struct metaspace {
             if (const auto symbol = model.id(character)) out.push_back(*symbol);
             else for (const unsigned char byte : character) out.push_back(fallback[byte]);
         }
+        return true;  // every byte has a fallback token
     }
 };
 }
@@ -164,14 +167,14 @@ struct tokenizer::impl {
         return {};
     }
 
-    // Appends the BPE of one pre-tokenized word.
-    template<family<impl> F> void merge(const F& kind, std::string_view word, tokens& out) const {
+    // Appends the BPE of one pre-tokenized word. Only uncached words can lack a symbol.
+    template<family<impl> F> result<void> merge(const F& kind, std::string_view word, tokens& out) const {
         if (const auto found = cache.find(word); found != cache.end()) {
             out.insert(out.end(), found->second.begin(), found->second.end());
-            return;
+            return {};
         }
         tokens parts;
-        kind.symbols(*this, word, parts);
+        if (!kind.symbols(*this, word, parts)) return fail(errc::invalid, "Text contains a byte the tokenizer cannot encode");
         while (parts.size() > 1) {
             rule best{std::numeric_limits<int>::max(), 0};
             std::size_t at = 0;
@@ -183,10 +186,11 @@ struct tokenizer::impl {
             parts.erase(parts.begin() + std::ptrdiff_t(at) + 1);
         }
         out.insert(out.end(), parts.begin(), parts.end());
-        if (word.size() > 4096) return;
+        if (word.size() > 4096) return {};
         if (cache.size() >= 16384 || cache_bytes > 4 * 1024 * 1024) cache.clear(), cache_bytes = 0;
         cache_bytes += word.size() + parts.size() * sizeof(token);
         cache.emplace(std::string(word), std::move(parts));
+        return {};
     }
 
     // Added tokens split the text; the rest is normalized, pre-tokenized and merged.
@@ -263,12 +267,11 @@ result<tokenizer> tokenizer::load(const std::filesystem::path& file) {
     }
     LAYA_CHECK(state->read_rules(model, added_tokens));
     auto& kind = state->kind.emplace<byte_level>();
-    // GPT-2 maps each byte to a printable code point.
+    // GPT-2 maps each byte to a printable code point. Vocabularies may lack symbols, such as those of
+    // bytes that never occur in UTF-8 (GPT-NeoX lacks C0, C1 and F5-FF); only text that needs one fails.
     for (int byte = 0, next = 256; byte < 256; ++byte) {
         const bool visible = (byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172) || byte >= 174;
-        const auto symbol = state->id(utf8(visible ? byte : next++));
-        if (!symbol) return unsupported();
-        kind.bytes[byte] = *symbol;
+        kind.bytes[byte] = state->id(utf8(visible ? byte : next++)).value_or(missing);
     }
     UErrorCode status = U_ZERO_ERROR;
     kind.nfc = icu::Normalizer2::getNFCInstance(status);
