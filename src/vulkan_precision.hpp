@@ -1,7 +1,6 @@
 #pragma once
 #include "vulkan_ops.hpp"
 #include "vulkan/projection_plans.hpp"
-#include <stdexcept>
 
 // Portable Vulkan graph operations preserve the BF16 boundaries of autocast:
 // projections and activations round to BF16, while residuals and normalization

@@ -42,4 +42,6 @@ using result = std::expected<T, error>;
     if (!name) return std::unexpected(std::move(name).error())
 // Returns the error of a result<void> expression, if any.
 #define LAYA_CHECK(...) \
-    if (auto laya_status_ = (__VA_ARGS__); !laya_status_) return std::unexpected(std::move(laya_status_).error())
+    do { \
+        if (auto laya_status_ = (__VA_ARGS__); !laya_status_) return std::unexpected(std::move(laya_status_).error()); \
+    } while (false)

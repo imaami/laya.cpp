@@ -1,5 +1,4 @@
 #include "laya/precision.hpp"
-#include <stdexcept>
 #include <cmath>
 #include <cstring>
 namespace laya {
@@ -31,7 +30,7 @@ void mlp_cpu(ggml_tensor* dst, int ith, int nth, void*) {
     }
 }
 void qkv_cpu(ggml_tensor* dst, int ith, int nth, void*) {
-    if (dst->type==GGML_TYPE_BF16) throw std::runtime_error("BF16 QKV packing requires CUDA");
+    if (dst->type==GGML_TYPE_BF16) GGML_ABORT("BF16 QKV packing requires CUDA");
     auto input=static_cast<const float*>(dst->src[0]->data);
     auto output=static_cast<float*>(dst->data);
     auto cosine=dst->src[1] ? static_cast<const float*>(dst->src[1]->data) : nullptr;
@@ -73,58 +72,58 @@ ggml_tensor* linear_bf16(ggml_context* ctx,ggml_tensor* input,ggml_tensor* weigh
         !ggml_is_contiguous(weight) || input->ne[0]!=weight->ne[0] || input->ne[2]!=1 || input->ne[3]!=1 ||
         weight->ne[2]!=1 || weight->ne[3]!=1 || (bias && (bias->type!=GGML_TYPE_F32 ||
         !ggml_is_contiguous(bias) || ggml_nelements(bias)!=weight->ne[1])))
-        throw std::invalid_argument("BF16 projection requires compatible contiguous matrices and bias");
+        GGML_ABORT("BF16 projection requires compatible contiguous matrices and bias");
     if (residual && (compact || residual->type!=GGML_TYPE_F32 || !ggml_is_contiguous(residual) ||
         residual->ne[0]!=weight->ne[1] || residual->ne[1]!=input->ne[1] || residual->ne[2]!=1 || residual->ne[3]!=1))
-        throw std::invalid_argument("BF16 residual projection requires matching FP32 residual rows");
+        GGML_ABORT("BF16 residual projection requires matching FP32 residual rows");
     ggml_tensor* args[]{input,weight,bias,residual};
     auto result=ggml_custom_4d(ctx,compact ? GGML_TYPE_BF16 : GGML_TYPE_F32,weight->ne[1],input->ne[1],1,1,args,residual ? 4 : bias ? 3 : 2,
-        [](ggml_tensor*,int,int,void*) { throw std::runtime_error("BF16 projection requires CUDA"); },1,nullptr);
+        [](ggml_tensor*,int,int,void*) { GGML_ABORT("BF16 projection requires CUDA"); },1,nullptr);
     ggml_set_name(result,"laya.linear-bf16");return result;
 }
 ggml_tensor* gelu_bf16(ggml_context* ctx, ggml_tensor* input) {
     if (input->type!=GGML_TYPE_F32 || !ggml_is_contiguous(input))
-        throw std::invalid_argument("BF16 GELU requires contiguous FP32 input");
+        GGML_ABORT("BF16 GELU requires contiguous FP32 input");
     auto result=ggml_custom_4d(ctx,GGML_TYPE_F32,input->ne[0],input->ne[1],input->ne[2],input->ne[3],&input,1,
-        [](ggml_tensor*,int,int,void*) { throw std::runtime_error("BF16 GELU requires CUDA"); },1,nullptr);
+        [](ggml_tensor*,int,int,void*) { GGML_ABORT("BF16 GELU requires CUDA"); },1,nullptr);
     ggml_set_name(result,"laya.gelu-bf16");return result;
 }
 ggml_tensor* norm_bf16(ggml_context* ctx, ggml_tensor* input, ggml_tensor* weight, ggml_tensor* bias, bool compact) {
     if (input->type!=GGML_TYPE_F32 || !ggml_is_contiguous(input) || input->ne[0]%4 ||
         weight->type!=GGML_TYPE_F32 || !ggml_is_contiguous(weight) || ggml_nelements(weight)!=input->ne[0] ||
         (bias && (bias->type!=GGML_TYPE_F32 || !ggml_is_contiguous(bias) || ggml_nelements(bias)!=input->ne[0])))
-        throw std::invalid_argument("BF16 normalization requires aligned FP32 rows and affine parameters");
+        GGML_ABORT("BF16 normalization requires aligned FP32 rows and affine parameters");
     ggml_tensor* args[]{input,weight,bias};
     auto result=ggml_custom_4d(ctx,compact ? GGML_TYPE_BF16 : GGML_TYPE_F32,input->ne[0],input->ne[1],input->ne[2],input->ne[3],args,bias ? 3 : 2,
-        [](ggml_tensor*,int,int,void*) { throw std::runtime_error("BF16 normalization requires CUDA"); },1,nullptr);
+        [](ggml_tensor*,int,int,void*) { GGML_ABORT("BF16 normalization requires CUDA"); },1,nullptr);
     ggml_set_name(result,"laya.norm-bf16");
     return result;
 }
 ggml_tensor* attention_mask(ggml_context* ctx, ggml_tensor* lengths, int length, int padded, bool local, bool half) {
     if (lengths->type!=GGML_TYPE_I32 || !ggml_is_contiguous(lengths) || length<1 || padded<length)
-        throw std::invalid_argument("Invalid attention mask shape");
+        GGML_ABORT("Invalid attention mask shape");
     auto result=ggml_custom_4d(ctx,half ? GGML_TYPE_F16 : GGML_TYPE_F32,length,padded,1,ggml_nelements(lengths),&lengths,1,mask_cpu,1,nullptr);
     ggml_set_name(result,local ? "laya.mask-local" : "laya.mask-global");
     return result;
 }
 ggml_tensor* mlp_bf16(ggml_context* ctx, ggml_tensor* input) {
     if ((input->type!=GGML_TYPE_F32 && input->type!=GGML_TYPE_BF16) || !ggml_is_contiguous(input) || input->ne[0]%2)
-        throw std::invalid_argument("BF16 MLP requires contiguous paired FP32 or BF16 products");
+        GGML_ABORT("BF16 MLP requires contiguous paired FP32 or BF16 products");
     auto result=ggml_custom_4d(ctx,GGML_TYPE_BF16,input->ne[0]/2,input->ne[1],input->ne[2],input->ne[3],&input,1,
-        [](ggml_tensor*,int,int,void*) { throw std::runtime_error("BF16 MLP requires CUDA"); },1,nullptr);
+        [](ggml_tensor*,int,int,void*) { GGML_ABORT("BF16 MLP requires CUDA"); },1,nullptr);
     ggml_set_name(result,"laya.mlp-bf16");
     return result;
 }
 ggml_tensor* mlp_split_f16(ggml_context* ctx, ggml_tensor* input) {
     if (!ggml_is_contiguous(input) || input->type!=GGML_TYPE_F32 || input->ne[0]%2 || input->ne[1]%2 || input->ne[2]!=1 || input->ne[3]!=1)
-        throw std::invalid_argument("MLP splitting requires paired FP32 matrices");
+        GGML_ABORT("MLP splitting requires paired FP32 matrices");
     auto result=ggml_custom_4d(ctx,GGML_TYPE_F16,input->ne[0]/2,input->ne[1],1,1,&input,1,mlp_cpu,1,nullptr);
     ggml_set_name(result,"laya.mlp-split");
     return result;
 }
 ggml_tensor* pack_qkv(ggml_context* ctx, ggml_tensor* input, ggml_tensor* cosine, ggml_tensor* sine, int length, int batch, bool bf16) {
     if (!ggml_is_contiguous(input) || (input->type!=GGML_TYPE_F32 && !(bf16 && input->type==GGML_TYPE_BF16)) || input->ne[0]%192!=0 || input->ne[1]!=int64_t(length)*batch)
-        throw std::invalid_argument("QKV packing requires compatible contiguous input with 64-wide heads");
+        GGML_ABORT("QKV packing requires compatible contiguous input with 64-wide heads");
     ggml_tensor* args[]{input,cosine,sine};
     auto result=ggml_custom_4d(ctx,bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F32,64,length,input->ne[0]/192,3*batch,args,cosine ? 3 : 1,qkv_cpu,1,nullptr);
     ggml_set_name(result,bf16 ? "laya.pack-qkv-bf16" : "laya.pack-qkv");
@@ -132,14 +131,14 @@ ggml_tensor* pack_qkv(ggml_context* ctx, ggml_tensor* input, ggml_tensor* cosine
 }
 ggml_tensor* split_f16(ggml_context* ctx, ggml_tensor* input) {
     if (!ggml_is_contiguous(input) || input->type!=GGML_TYPE_F32 || input->ne[2]!=1 || input->ne[3]!=1)
-        throw std::invalid_argument("Split requires a contiguous FP32 matrix");
+        GGML_ABORT("Split requires a contiguous FP32 matrix");
     auto result=ggml_custom_4d(ctx,GGML_TYPE_F16,input->ne[0],2*input->ne[1],1,1,&input,1,split_cpu,1,nullptr);
     ggml_set_name(result,"laya.split-f16");
     return result;
 }
 ggml_tensor* merge_f16(ggml_context* ctx, ggml_tensor* input) {
     if (!ggml_is_contiguous(input) || input->type!=GGML_TYPE_F32 || input->ne[1]%2 || input->ne[2]!=1 || input->ne[3]!=1)
-        throw std::invalid_argument("Merge requires a contiguous paired FP32 matrix");
+        GGML_ABORT("Merge requires a contiguous paired FP32 matrix");
     auto result=ggml_custom_4d(ctx,GGML_TYPE_F32,input->ne[0],input->ne[1]/2,1,1,&input,1,merge_cpu,1,nullptr);
     ggml_set_name(result,"laya.merge-f16");
     return result;

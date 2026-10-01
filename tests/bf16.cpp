@@ -5,8 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
-#include <stdexcept>
 #include <vector>
+#include "check.hpp"
 
 const char *laya_cuda_bf16_compatibility_error();
 namespace {
@@ -28,11 +28,11 @@ struct graph {
     }
     void allocate() {
         if (!ggml_gallocr_alloc_graph(allocator, value))
-            throw std::runtime_error("Allocation failed");
+            laya::test::fail("Allocation failed");
     }
     void run() {
         if (ggml_backend_graph_compute(backend, value) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("Compute failed");
+            laya::test::fail("Compute failed");
     }
 };
 std::vector<float> read(ggml_tensor *t) {
@@ -67,7 +67,7 @@ void gelu(ggml_backend_t backend) {
     ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
     g.run();
     if (read(y) != expected)
-        throw std::runtime_error("BF16 GELU rounding differs from the compatibility profile");
+        laya::test::fail("BF16 GELU rounding differs from the compatibility profile");
     graph fused(backend);
     const int width = input.size();
     auto products = ggml_new_tensor_2d(fused.ctx, GGML_TYPE_F32, 2 * width, 3);
@@ -96,12 +96,12 @@ void gelu(ggml_backend_t backend) {
     ggml_backend_tensor_get(compact_activated, compact_outputs.data(), 0, ggml_nbytes(compact_activated));
     for (size_t i = 0; i < actual.size(); ++i)
         if (ggml_bf16_to_fp32(actual[i]) != ggml_bf16_to_fp32(compact_outputs[i]))
-            throw std::runtime_error("Compact MLP input changed BF16 rounding");
+            laya::test::fail("Compact MLP input changed BF16 rounding");
     for (int row = 0; row < 3; ++row)
         for (int i = 0; i < width; ++i)
             if (ggml_bf16_to_fp32(actual[row * width + i]) !=
                 rounded(expected[i] * packed[row * 2 * width + width + i]))
-                throw std::runtime_error("Fused BF16 MLP changed a GELU or product rounding boundary");
+                laya::test::fail("Fused BF16 MLP changed a GELU or product rounding boundary");
 }
 void projection(ggml_backend_t backend, int columns) {
     graph g(backend);
@@ -140,19 +140,19 @@ void projection(ggml_backend_t backend, int columns) {
     auto with_residual = read(added);
     for (size_t i = 0; i < actual.size(); ++i)
         if (with_residual[i] != residuals[i] + actual[i])
-            throw std::runtime_error("Fused projection changed FP32 residual addition");
+            laya::test::fail("Fused projection changed FP32 residual addition");
     std::vector<ggml_bf16_t> compact_values(actual.size());
     ggml_backend_tensor_get(compact, compact_values.data(), 0, ggml_nbytes(compact));
     for (size_t i = 0; i < actual.size(); ++i)
         if (ggml_bf16_to_fp32(compact_values[i]) != actual[i])
-            throw std::runtime_error("Compact BF16 projection changed output rounding");
+            laya::test::fail("Compact BF16 projection changed output rounding");
     for (int col = 0; col < columns; ++col)
         for (int row = 0; row < outputs; ++row) {
             float expected = biases[row];
             for (int i = 0; i < width; ++i)
                 expected += ggml_bf16_to_fp32(inputs[col * width + i]) * ggml_bf16_to_fp32(weights[row * width + i]);
             if (actual[col * outputs + row] != rounded(expected))
-                throw std::runtime_error("BF16 biased projection differs from exact binary arithmetic");
+                laya::test::fail("BF16 biased projection differs from exact binary arithmetic");
         }
 }
 void normalization(ggml_backend_t backend, int width) {
@@ -182,7 +182,7 @@ void normalization(ggml_backend_t backend, int width) {
     ggml_backend_tensor_get(compact, compact_values.data(), 0, ggml_nbytes(compact));
     for (size_t i = 0; i < actual.size(); ++i)
         if (ggml_bf16_to_fp32(compact_values[i]) != rounded(actual[i]))
-            throw std::runtime_error("Compact normalization changed the BF16 projection input");
+            laya::test::fail("Compact normalization changed the BF16 projection input");
     for (int row = 0; row < 3; ++row) {
         double mean = 0, var = 0;
         for (int i = 0; i < width; ++i)
@@ -194,7 +194,7 @@ void normalization(ggml_backend_t backend, int width) {
         for (int i = 0; i < width; ++i) {
             double expected = (inputs[row * width + i] - mean) / std::sqrt(var + 1.e-5) * weights[i] + biases[i];
             if (!std::isfinite(actual[row * width + i]) || std::abs(actual[row * width + i] - expected) > 3.e-6)
-                throw std::runtime_error("BF16-path normalization differs from double precision");
+                laya::test::fail("BF16-path normalization differs from double precision");
         }
     }
 }
@@ -240,7 +240,7 @@ void attention(ggml_backend_t backend, int length, bool masked) {
                     for (int d = 0; d < 64; ++d) {
                         float expected = masked && t == length - 1 ? 0 : float(b + h + int(d % 9) - 4) / 8;
                         if (actual[((b * length + t) * heads + h) * 64 + d] != expected)
-                            throw std::runtime_error("BF16 attention changed a constant value or an empty masked row");
+                            laya::test::fail("BF16 attention changed a constant value or an empty masked row");
                     }
     }
 }
@@ -267,7 +267,7 @@ void compact_packing(ggml_backend_t backend) {
         int row = i / (64 * length * heads) % batch, component = i / (64 * length * heads * batch);
         int source = (row * length + token) * 3 * width + component * width + head * 64 + d;
         if (ggml_bf16_to_fp32(actual[i]) != ggml_bf16_to_fp32(values[source]))
-            throw std::runtime_error("Compact QKV packing changed values with zero rotation");
+            laya::test::fail("Compact QKV packing changed values with zero rotation");
     }
 }
 void local_attention(ggml_backend_t backend, int length) {
@@ -301,7 +301,7 @@ void local_attention(ggml_backend_t backend, int length) {
         ggml_backend_tensor_set(lengths, sizes, 0, sizeof(sizes));
         g.run();
         if (read(reference) != read(optimized))
-            throw std::runtime_error("Skipping masked local tiles changed attention or padded-query fallback");
+            laya::test::fail("Skipping masked local tiles changed attention or padded-query fallback");
     }
 }
 } // namespace
@@ -314,23 +314,17 @@ int main() {
         ggml_backend_free(backend);
         return 77;
     }
-    try {
-        gelu(backend);
-        compact_packing(backend);
-        for (int columns : {1, 7})
-            projection(backend, columns);
-        for (int width : {768, 1024})
-            normalization(backend, width);
-        for (int length : {1, 17, 68, 184, 512, 1024})
-            for (bool masked : {false, true})
-                attention(backend, length, masked);
-        for (int length : {184, 512, 1024})
-            local_attention(backend, length);
-        ggml_backend_free(backend);
-        std::cout << "BF16 kernels and replay passed\n";
-    } catch (const std::exception &error) {
-        ggml_backend_free(backend);
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
+    gelu(backend);
+    compact_packing(backend);
+    for (int columns : {1, 7})
+        projection(backend, columns);
+    for (int width : {768, 1024})
+        normalization(backend, width);
+    for (int length : {1, 17, 68, 184, 512, 1024})
+        for (bool masked : {false, true})
+            attention(backend, length, masked);
+    for (int length : {184, 512, 1024})
+        local_attention(backend, length);
+    ggml_backend_free(backend);
+    std::cout << "BF16 kernels and replay passed\n";
 }

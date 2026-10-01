@@ -1,13 +1,12 @@
 #include "laya/decision.hpp"
 #include <algorithm>
 #include <cmath>
-#include <stdexcept>
 
-laya::decision laya::calibrate(std::span<const float> logits, double temperature) {
+laya::result<laya::decision> laya::calibrate(std::span<const float> logits, double temperature) {
     if (logits.empty() || !std::isfinite(temperature))
-        throw std::invalid_argument("nonempty logits and finite temperature required");
+        return fail(errc::invalid, "nonempty logits and finite temperature required");
     for (float x : logits)
-        if (!std::isfinite(x)) throw std::invalid_argument("logits must be finite");
+        if (!std::isfinite(x)) return fail(errc::invalid, "logits must be finite");
     const double scale = std::max(0.001, temperature);
     const double maximum = *std::max_element(logits.begin(), logits.end());
     decision result{{}, 0, 0, 1};

@@ -1,4 +1,5 @@
 #pragma once
+#include "laya/error.hpp"
 #include <span>
 #include <vector>
 
@@ -10,5 +11,5 @@ struct decision {
     double confidence;
 };
 // Logits must contain only valid options; temperature is clamped to 0.001.
-decision calibrate(std::span<const float> logits, double temperature = 1.0);
+[[nodiscard]] result<decision> calibrate(std::span<const float> logits, double temperature = 1.0);
 }

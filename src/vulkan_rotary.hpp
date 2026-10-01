@@ -1,13 +1,13 @@
 #pragma once
+#include "ggml.h"
 #include "vulkan/rotary_cuda.hpp"
 #include "vulkan/rotary_rocm.hpp"
 #include <bit>
 #include <cmath>
-#include <stdexcept>
 namespace laya::vulkan_precision {
 inline float rotary(bool rocm,int base,int position,int dimension,bool sine) {
     if (base<0 || base>1 || position<0 || position>=1024 || dimension<0 || dimension>=32)
-        throw std::invalid_argument("Unsupported rotary position or dimension");
+        GGML_ABORT("Unsupported rotary position or dimension");
     const auto* inverse=rocm ? rotary_rocm_inverse : rotary_cuda_inverse;
     const auto* corrections=rocm ? rotary_rocm_corrections : rotary_cuda_corrections;
     const float angle=float(position)*std::bit_cast<float>(inverse[base*32+dimension]);
