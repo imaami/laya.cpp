@@ -19,12 +19,15 @@ const char* laya_cuda_bf16_compatibility_error();
 #include "laya/coreml.hpp"
 #endif
 #include <algorithm>
+#include <bit>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <span>
 #include <unordered_map>
 
@@ -142,6 +145,15 @@ template<std::size_t I = 0, class F> dispatched<F> dispatch(mode m, F&& f) {
 }
 
 template<class Values> void put(tensor* t, const Values& values) { ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t)); }
+// IEEE magnitudes as bits order like the values; nonfinite values have every exponent bit set.
+constexpr std::int32_t infinity(ggml_type type) { return type == GGML_TYPE_F32 ? 0x7f800000 : type == GGML_TYPE_F16 ? 0x7c00 : 0x7f80; }
+// The largest magnitude bits of an F32 or 16-bit payload: a branch-free reduction compilers vectorize.
+template<class T> std::int32_t largest_magnitude(const std::vector<T>& payload) {
+    using bits = std::conditional_t<sizeof(T) == 4, std::int32_t, std::int16_t>;
+    bits largest = 0;
+    for (const T x : payload) largest = std::max<bits>(largest, std::bit_cast<bits>(x) & std::numeric_limits<bits>::max());
+    return largest;
+}
 
 // How a checkpoint tensor is stored on the device; the mode maps each role to a type.
 enum class role : std::uint8_t {
@@ -419,7 +431,7 @@ struct numerics<M> {
             // products before the final rounding.
             if (bf16 && weight->ne[1] == 1 && x->ne[1] > 1 && !plan.chunk) plan.chunk = 64;
         }
-        return {vulkan_precision::linear(ctx, x, weight, bias, residual, low, plan, false, amd)};
+        return {vulkan_precision::linear(ctx, x, weight, bias, residual, low, plan, amd)};
     }
     static wide gelu(ggml_context* ctx, tensor* table, wide x) { return {vulkan_precision::activation(ctx, x.t, table, false, bf16)}; }
     template<bool Stored> static wide gated_gelu(ggml_context* ctx, tensor* table, operand<Stored> gated) {
@@ -777,50 +789,49 @@ struct runtime::impl {
         if (!buffer) return fail(errc::backend, "Insufficient device memory for model weights");
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        // Payloads are validated and uploaded in name order.
+        // Payloads are validated and uploaded in name order. A payload already in
+        // its device type is uploaded as read; others convert exactly through FP32.
         std::vector<const entry*> order;
         for (const auto& e : list) order.push_back(&e);
         std::ranges::sort(order, {}, &entry::name);
         const std::uint64_t payload_size = file_size - 8 - header_size;
-        std::vector<char> bytes;
-        std::vector<float> values;
+        std::vector<std::uint16_t> half;  // 16-bit payloads and device values
+        std::vector<float> values;        // F32 payloads and widened values
+        std::bitset<32768> exact;         // BF16 magnitudes AMD kernels convert exactly to F16
+        if (layout.amd_bf16_range)
+            for (uint magnitude = 0; magnitude < exact.size(); ++magnitude) exact[magnitude] = layaBf16ScaledFitsHalf(magnitude, 0);
         for (const auto* e : order) {
             auto* t = *e->slot;
             const auto& spec = field(*header, e->name);
             const auto &offsets = field(spec, "data_offsets"), &dtype = field(spec, "dtype");
+            const ggml_type source = dtype == "F16" ? GGML_TYPE_F16 : dtype == "BF16" ? GGML_TYPE_BF16 : dtype == "F32" ? GGML_TYPE_F32 : GGML_TYPE_COUNT;
             const auto count = std::size_t(ggml_nelements(t));
-            const std::size_t stride = dtype == "F16" || dtype == "BF16" ? 2 : dtype == "F32" ? 4 : 0;
             const bool valid = offsets.is_array() && offsets.size() == 2 && offsets[0].is_number_unsigned() && offsets[1].is_number_unsigned();
             const auto begin = valid ? offsets[0].get<std::uint64_t>() : 0, end = valid ? offsets[1].get<std::uint64_t>() : 0;
-            if (!valid || !stride || end < begin || end > payload_size || end - begin != std::uint64_t(count) * stride)
+            if (!valid || source == GGML_TYPE_COUNT || end < begin || end > payload_size || end - begin != count * ggml_type_size(source))
                 return fail(errc::model, "Invalid safetensors payload: " + e->name);
-            bytes.resize(count * stride);
+            const bool wide = source == GGML_TYPE_F32;
+            wide ? values.resize(count) : half.resize(count);
             file.seekg(std::streamoff(8 + header_size + begin));
-            file.read(bytes.data(), std::streamsize(bytes.size()));
+            file.read(wide ? reinterpret_cast<char*>(values.data()) : reinterpret_cast<char*>(half.data()), std::streamsize(end - begin));
             if (!file) return fail(errc::model, "Truncated tensor payload: " + e->name);
-            values.resize(count);
-            if (dtype == "F16") ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t*>(bytes.data()), values.data(), std::int64_t(count));
-            else if (dtype == "BF16") ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t*>(bytes.data()), values.data(), std::int64_t(count));
-            else std::memcpy(values.data(), bytes.data(), bytes.size());
-            if (!std::ranges::all_of(values, [](float x) { return std::isfinite(x); }))
+            if ((wide ? largest_magnitude<float>(values) : largest_magnitude<std::uint16_t>(half)) >= infinity(source))
                 return fail(errc::model, "Nonfinite checkpoint values: " + e->name);
-            if (t->type == GGML_TYPE_BF16) {
-                std::vector<ggml_bf16_t> converted(count);
-                ggml_fp32_to_bf16_row_ref(values.data(), converted.data(), std::int64_t(count));
-                if (layout.amd_bf16_range && !std::ranges::all_of(converted, [](ggml_bf16_t x) { return layaBf16ScaledFitsHalf(x.bits, 0); }))
-                    return fail(errc::model, "AMD Vulkan BF16 projection weights exceed exact conversion range: " + e->name);
-                put(t, converted);
-            } else if (t->type == GGML_TYPE_F16) {
-                std::vector<ggml_fp16_t> converted(count);
-                ggml_fp32_to_fp16_row(values.data(), converted.data(), std::int64_t(count));
-                put(t, converted);
-            } else {
-                if (e->kind == role::bias && layout.bias == GGML_TYPE_F16)
+            const bool rounded_bias = e->kind == role::bias && layout.bias != GGML_TYPE_F32;
+            if (t->type != source || rounded_bias) {
+                if (source == GGML_TYPE_F16) values.resize(count), ggml_fp16_to_fp32_row(half.data(), values.data(), std::int64_t(count));
+                if (source == GGML_TYPE_BF16) values.resize(count), ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t*>(half.data()), values.data(), std::int64_t(count));
+                if (rounded_bias && layout.bias == GGML_TYPE_F16)
                     for (auto& x : values) x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
-                if (e->kind == role::bias && layout.bias == GGML_TYPE_BF16)
+                if (rounded_bias && layout.bias == GGML_TYPE_BF16)
                     for (auto& x : values) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
-                put(t, values);
+                if (t->type != GGML_TYPE_F32) half.resize(count);
+                if (t->type == GGML_TYPE_F16) ggml_fp32_to_fp16_row(values.data(), half.data(), std::int64_t(count));
+                if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(values.data(), reinterpret_cast<ggml_bf16_t*>(half.data()), std::int64_t(count));
             }
+            if (layout.amd_bf16_range && t->type == GGML_TYPE_BF16 && !std::ranges::all_of(half, [&](std::uint16_t x) { return exact[x & 0x7fff]; }))
+                return fail(errc::model, "AMD Vulkan BF16 projection weights exceed exact conversion range: " + e->name);
+            t->type == GGML_TYPE_F32 ? put(t, values) : put(t, half);
         }
         if (auto* table = w.gelu_table) {
             using namespace vulkan_precision;

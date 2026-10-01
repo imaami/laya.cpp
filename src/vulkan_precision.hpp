@@ -10,19 +10,12 @@ namespace laya::vulkan_precision {
 inline ggml_tensor* round(ggml_context* ctx, ggml_tensor* x, ggml_type type) {
     return ggml_cast(ctx, ggml_cast(ctx,x,type),GGML_TYPE_F32);
 }
-inline ggml_tensor* linear(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight,
-                          ggml_tensor* bias, ggml_tensor* residual, ggml_type type,
-                          projection_plan plan={}, bool native_low_input=false, bool amd_matching=false) {
-    // Keep eligible NVIDIA inputs in storage precision instead of widening
-    // here and converting back inside the backend. Other reduction paths retain
-    // their validated F32-input kernels and partition layout.
-    const bool keep_low=native_low_input && !plan.chunk && x->type==type && weight->ne[1]>=64 && x->ne[1]>1;
-    if (!keep_low && x->type!=GGML_TYPE_F32) x=ggml_cast(ctx,x,GGML_TYPE_F32);
+inline ggml_tensor* linear(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias, ggml_tensor* residual,
+                          ggml_type type, projection_plan plan={}, bool amd_matching=false) {
+    if (x->type!=GGML_TYPE_F32) x=ggml_cast(ctx,x,GGML_TYPE_F32);
     ggml_tensor* product;
-    const int split_k=plan.chunk;
-    if (split_k) {
-        const int64_t parts=(weight->ne[0]+split_k-1)/split_k;
-        const int64_t padding=parts*split_k-weight->ne[0];
+    if (const int split_k=plan.chunk) {
+        const int64_t parts=(weight->ne[0]+split_k-1)/split_k, padding=parts*split_k-weight->ne[0];
         auto padded_w=padding ? pad16(ctx,weight,padding) : weight;
         auto padded_x=padding ? ggml_pad(ctx,x,padding,0,0,0) : x;
         auto wa=ggml_permute(ctx,ggml_reshape_3d(ctx,padded_w,split_k,parts,weight->ne[1]),0,2,1,3);
@@ -40,19 +33,8 @@ inline ggml_tensor* linear(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weigh
     } else {
         product=ggml_mul_mat(ctx,weight,x);
         ggml_prec_set_acc(product,GGML_PREC_F32);
-        if (keep_low) ggml_set_name(product,"laya.low-projection");
         if (amd_matching) ggml_set_name(product,"laya.amd-low-projection");
     }
     return finish_projection(ctx,product,bias,residual,type);
-}
-inline ggml_tensor* gelu(ggml_context* ctx, ggml_tensor* x, ggml_type type) {
-    return round(ctx,ggml_gelu_erf(ctx,x),type);
-}
-inline ggml_tensor* mlp(ggml_context* ctx, ggml_tensor* x, ggml_type type) {
-    if (x->type!=GGML_TYPE_F32) x=ggml_cast(ctx,x,GGML_TYPE_F32);
-    const int64_t width=x->ne[0]/2;
-    auto first=ggml_cont(ctx,ggml_view_2d(ctx,x,width,x->ne[1],x->nb[1],0));
-    auto gate=ggml_cont(ctx,ggml_view_2d(ctx,x,width,x->ne[1],x->nb[1],width*sizeof(float)));
-    return round(ctx,ggml_mul(ctx,gelu(ctx,first,type),gate),type);
 }
 }
