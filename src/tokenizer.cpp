@@ -137,8 +137,9 @@ result<tokens> tokenizer::encode(std::string_view text) const {
 std::optional<token> tokenizer::id(std::string_view text) const { return p->id(text); }
 
 result<tokenizer> tokenizer::load(const std::filesystem::path& file) {
-    auto document = read_json(file);
+    auto document = read_json<nlohmann::json>(file);  // vocabulary order is irrelevant
     if (!document) return document.error().code == errc::io ? fail(errc::io, "Cannot open tokenizer: " + file.string()) : std::unexpected(document.error());
+    using json = nlohmann::json;
     const json &model = field(*document, "model"), &normalizer = field(*document, "normalizer"), &pre = field(*document, "pre_tokenizer");
     const json &pattern = field(normalizer, "pattern"), &entries = field(model, "vocab"), &rules = field(model, "merges"), &added_tokens = field(*document, "added_tokens");
     const bool byte_fallback = field(model, "byte_fallback") == true;

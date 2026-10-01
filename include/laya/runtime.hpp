@@ -20,12 +20,18 @@ constexpr bool input_error(errc code) { return code <= errc::too_large; }
 #define LAYA_TRY(name, ...) auto name = (__VA_ARGS__); if (!name) return std::unexpected(std::move(name).error())
 #define LAYA_CHECK(...) do { if (auto laya_status_ = (__VA_ARGS__); !laya_status_) return std::unexpected(std::move(laya_status_).error()); } while (false)
 
-// Object order is protocol: it orders choices and answers.
+// Object order is protocol: it orders choices and answers. Documents without
+// meaningful order, such as tokenizer vocabularies, parse as nlohmann::json,
+// whose objects insert keys in logarithmic rather than linear time.
 using json = nlohmann::ordered_json;
-[[nodiscard]] result<json> parse_json(std::string_view text);  // syntax errors carry nlohmann's message
-[[nodiscard]] result<json> read_json(const std::filesystem::path& path);
+template<class Json = json> [[nodiscard]] result<Json> parse_json(std::string_view text);  // syntax errors carry nlohmann's message
+template<class Json = json> [[nodiscard]] result<Json> read_json(const std::filesystem::path& path);
 std::string dump(const json& value);  // invalid UTF-8 becomes U+FFFD
-const json& field(const json& object, std::string_view key);  // null when either is missing
+template<class Json> const Json& field(const Json& object, std::string_view key) {  // null when either is missing
+    static const Json missing;
+    const auto found = object.find(key);
+    return found == object.end() ? missing : *found;
+}
 // Checked access, failing with the messages of nlohmann's at() and get<std::string>().
 [[nodiscard]] result<const json*> json_at(const json& object, std::string_view key);
 [[nodiscard]] result<std::string> json_string(const json& value);

@@ -23,27 +23,24 @@ struct syntax_error {
 };
 }
 
-result<json> parse_json(std::string_view text) {
-    if (json value = json::parse(text, nullptr, false); !value.is_discarded()) return value;
+template<class Json> result<Json> parse_json(std::string_view text) {
+    if (Json value = Json::parse(text, nullptr, false); !value.is_discarded()) return value;
     syntax_error failure;
-    json::sax_parse(text, &failure);
+    Json::sax_parse(text, &failure);
     return fail(errc::parse, std::move(failure.message));
 }
 
-result<json> read_json(const std::filesystem::path& path) {
+template<class Json> result<Json> read_json(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
     const std::string text{std::istreambuf_iterator<char>(file), {}};
     if (!file.is_open() || file.bad()) return fail(errc::io, (file.is_open() ? "Cannot read " : "Cannot open ") + path.string());
-    return parse_json(text).transform_error([](error e) { return e.code = errc::model, e; });
+    return parse_json<Json>(text).transform_error([](error e) { return e.code = errc::model, e; });
 }
+template result<json> parse_json(std::string_view);
+template result<json> read_json(const std::filesystem::path&);
+template result<nlohmann::json> read_json(const std::filesystem::path&);
 
 std::string dump(const json& value) { return value.dump(-1, ' ', false, json::error_handler_t::replace); }
-
-const json& field(const json& object, std::string_view key) {
-    static const json missing;
-    const auto found = object.find(key);
-    return found == object.end() ? missing : *found;
-}
 
 result<const json*> json_at(const json& object, std::string_view key) {
     if (!object.is_object()) return fail(errc::invalid, std::string("[json.exception.type_error.304] cannot use at() with ") + object.type_name());
