@@ -24,20 +24,25 @@ void interrupt(int) { interrupted.store(true, std::memory_order_relaxed); }
 using signal_handler = void (*)(int);
 }
 
-struct http_server::call {
-    struct reply {
-        json results;
-        double elapsed;
-        std::uint64_t batch;
-        std::size_t offset;
-    };
-    json requests;
-    std::size_t questions = 0;
-    std::chrono::steady_clock::time_point arrived = std::chrono::steady_clock::now();
-    std::promise<result<reply>> answer;
-};
-
 struct http_server::impl {
+    struct call {
+        struct reply {
+            json results;
+            double elapsed;
+            std::uint64_t batch;
+            std::size_t offset;
+        };
+        json requests;
+        std::size_t questions = 0;
+        std::chrono::steady_clock::time_point arrived = std::chrono::steady_clock::now();
+        std::promise<result<reply>> answer;
+    };
+    // Calls combined into one model batch.
+    struct work {
+        json requests = json::array();  // the requests of every call, in queue order
+        std::uint64_t id = 0;
+        std::vector<std::shared_ptr<call>> calls;
+    };
     http_options options;
     httplib::Server server;
     std::mutex mutex;
@@ -45,7 +50,9 @@ struct http_server::impl {
     std::deque<std::shared_ptr<call>> queue;
     std::size_t pending = 0;
     bool stopping = false;
-    std::uint64_t batch_id = 0;  // inference thread only
+    std::uint64_t batch_id = 0;  // inference thread only, as are:
+    work current;
+    std::deque<work> retry;  // calls of a failed batch, each alone
     std::atomic<std::uint64_t> request_id{0};
     std::string model;
     // start() and join()
@@ -139,25 +146,25 @@ struct http_server::impl {
 
     result<void> validate(const json& request, std::size_t& questions) const {
         if (!request.is_object()) return fail(errc::invalid, "Request must be an object");
-        LAYA_TRY(state, json_access::at(request, "state"));
+        LAYA_TRY(state, json_at(request, "state"));
         if (!(*state)->is_string() && !(*state)->is_structured())
             return fail(errc::invalid, "state must be a string, object or array");
         if (request.contains("model")) {
-            LAYA_TRY(name, json_access::string(field(request, "model")));
+            LAYA_TRY(name, json_string(field(request, "model")));
             if (*name != model) return fail(errc::invalid, "Requested model is not loaded; this server serves " + model);
         }
-        LAYA_TRY(definitions, json_access::at(request, "questions"));
+        LAYA_TRY(definitions, json_at(request, "questions"));
         if (!(*definitions)->is_object() || (*definitions)->empty())
             return fail(errc::invalid, "questions must be a nonempty object");
         if ((*definitions)->size() > options.max_questions - questions)
             return fail(errc::too_large, "Request exceeds --max-questions limit");
         questions += (*definitions)->size();
         for (const auto& definition : **definitions) {
-            LAYA_TRY(instruction, json_access::at(definition, "instructions"));
+            LAYA_TRY(instruction, json_at(definition, "instructions"));
             if (!(*instruction)->is_string() && !(*instruction)->is_structured())
                 return fail(errc::invalid, "instructions must be a string, object or array");
-            LAYA_TRY(type, json_access::at(definition, "type"));
-            LAYA_TRY(name, json_access::string(**type));
+            LAYA_TRY(type, json_at(definition, "type"));
+            LAYA_TRY(name, json_string(**type));
             if (*name != "choice" && *name != "score" && *name != "noul")
                 return fail(errc::invalid, "Unsupported question type: " + *name);
         }
@@ -203,10 +210,7 @@ struct http_server::impl {
     }
 };
 
-http_server::http_server(std::unique_ptr<impl> state) : p(std::move(state)) {}
-http_server::http_server(http_server&&) noexcept = default;
-http_server& http_server::operator=(http_server&&) noexcept = default;
-http_server::~http_server() = default;
+void http_server::release::operator()(impl* state) const { delete state; }
 
 result<http_server> http_server::create(http_options options) {
     if (options.variant != "english" && options.variant != "multilingual" && options.variant != "typed-decisions")
@@ -217,7 +221,9 @@ result<http_server> http_server::create(http_options options) {
     if (options.max_batch_questions < options.max_questions || options.max_pending_requests == 0 ||
         options.max_pending_requests > 256 || options.batch_wait_ms > 1000)
         return fail(errc::invalid, "Invalid HTTP batching limits");
-    return http_server(std::make_unique<impl>(std::move(options)));
+    http_server server;
+    server.p.reset(new impl(std::move(options)));
+    return server;
 }
 
 int http_server::bind() {
@@ -228,13 +234,19 @@ bool http_server::listen() { return p->server.listen_after_bind(); }
 bool http_server::running() const { return p->server.is_running(); }
 void http_server::stop() { p->stop(); }
 
-std::optional<http_server::work> http_server::next() {
+const json* http_server::next() {
     auto& s = *p;
-    work batch;
+    auto& batch = s.current;
+    if (!s.retry.empty()) {
+        batch = std::move(s.retry.front());
+        s.retry.pop_front();
+        return &batch.requests;
+    }
+    batch = {};
     {
         std::unique_lock lock(s.mutex);
         s.changed.wait(lock, [&] { return s.stopping || !s.queue.empty(); });
-        if (s.stopping) return std::nullopt;
+        if (s.stopping) return nullptr;
         const auto deadline = s.queue.front()->arrived + std::chrono::milliseconds(s.options.batch_wait_ms);
         std::size_t questions = 0;
         for (;;) {
@@ -253,40 +265,27 @@ std::optional<http_server::work> http_server::next() {
     batch.id = ++s.batch_id;
     for (const auto& item : batch.calls)
         for (const auto& request : item->requests) batch.requests.push_back(request);
-    return batch;
+    return &batch.requests;
 }
 
-void http_server::complete(work& batch, result<json> results, double elapsed_ms) {
-    if (results && (!results->is_array() || results->size() != batch.requests.size()))
-        results = fail(errc::backend, "Predictor returned an invalid result count");
-    if (!results) {
-        for (const auto& item : batch.calls) item->answer.set_value(std::unexpected(results.error()));
+void http_server::settle(result<json> results, double elapsed_ms) {
+    auto& s = *p;
+    auto& batch = s.current;
+    if (!results && input_error(results.error().code) && batch.calls.size() > 1) {
+        for (auto& item : batch.calls) s.retry.push_back({item->requests, ++s.batch_id, {std::move(item)}});
         return;
     }
+    if (results && (!results->is_array() || results->size() != batch.requests.size()))
+        results = fail(errc::backend, "Predictor returned an invalid result count");
     std::size_t offset = 0;
     for (const auto& item : batch.calls) {
         auto slice = json::array();
-        for (std::size_t i = 0; i < item->requests.size(); ++i) slice.push_back(std::move((*results)[offset + i]));
-        item->answer.set_value(call::reply{std::move(slice), elapsed_ms, batch.id, offset});
+        for (std::size_t i = 0; results && i < item->requests.size(); ++i) slice.push_back(std::move((*results)[offset + i]));
+        item->answer.set_value(results ? result<impl::call::reply>({std::move(slice), elapsed_ms, batch.id, offset}) : std::unexpected(results.error()));
         offset += item->requests.size();
     }
-}
-
-std::vector<http_server::work> http_server::split(work&& batch) {
-    std::vector<work> singles;
-    singles.reserve(batch.calls.size());
-    for (auto& item : batch.calls) {
-        work& single = singles.emplace_back();
-        single.id = ++p->batch_id;
-        single.requests = item->requests;
-        single.calls.push_back(std::move(item));
-    }
-    return singles;
-}
-
-void http_server::finish(std::size_t calls) {
-    std::lock_guard lock(p->mutex);
-    p->pending -= calls;
+    std::lock_guard lock(s.mutex);
+    s.pending -= batch.calls.size();
 }
 
 result<void> http_server::start() {

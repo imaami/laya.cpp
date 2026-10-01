@@ -32,7 +32,7 @@ result<std::vector<std::string>> options(int type, json& criteria) {
         if (criteria.is_array()) {
             auto mapping = json::object();
             for (const auto& value : criteria) {
-                LAYA_TRY(name, json_access::string(value));
+                LAYA_TRY(name, json_string(value));
                 mapping[*name] = nullptr;
             }
             criteria = std::move(mapping);
@@ -54,24 +54,19 @@ result<std::vector<std::string>> options(int type, json& criteria) {
 }
 }
 
-codec::codec(tokenizer&& words, const serving_config& serving, overflow policy)
-    : words(std::move(words)), limit(serving.max_len), budget(serving.head_max_len), policy(policy) {}
-
 result<codec> codec::load(const checkpoint& model, overflow policy) {
     LAYA_TRY(words, tokenizer::load(model.directory / "tokenizer/tokenizer.json"));
     LAYA_TRY(settings, read_json(model.directory / "tokenizer/tokenizer_config.json"));
-    codec loaded(std::move(*words), model.serving, policy);
+    codec loaded{std::move(*words), {}, 0, 0, 0, 0, model.serving.max_len, model.serving.head_max_len, policy};
     // A special token is a string or an added-token object with its content.
-    std::string text;
     for (auto [key, id] : {std::pair{"mask", &loaded.mask}, {"cls", &loaded.cls}, {"sep", &loaded.sep}, {"pad", &loaded.pad}}) {
         const json& value = field(*settings, std::string(key) + "_token");
         const json& content = value.is_string() ? value : field(value, "content");
         if (!content.is_string()) return fail(errc::model, std::string("Missing tokenizer setting: ") + key + "_token");
-        text = content.get<std::string>();
-        const auto found = loaded.words.id(text);
-        if (!found) return fail(errc::model, "Tokenizer lacks special token: " + text);
+        const auto found = loaded.words.id(content.get_ref<const std::string&>());
+        if (!found) return fail(errc::model, "Tokenizer lacks special token: " + content.get<std::string>());
         *id = *found;
-        if (id == &loaded.mask) loaded.mask_text = text;
+        if (id == &loaded.mask) loaded.mask_text = content.get<std::string>();
     }
     return loaded;
 }
@@ -92,19 +87,19 @@ template<overflow Policy> result<prepared> codec::build(const json& requests) co
     std::vector<tokens> sequences, positions;
     int request_index = 0;
     for (const auto& request : requests) {
-        LAYA_TRY(state_value, json_access::at(request, "state"));
+        LAYA_TRY(state_value, json_at(request, "state"));
         LAYA_TRY(state, encode(render(**state_value)));
-        LAYA_TRY(questions, json_access::at(request, "questions"));
+        LAYA_TRY(questions, json_at(request, "questions"));
         if (!(*questions)->is_object() || (*questions)->empty()) return rejected("questions must be a nonempty object");
         for (const auto& [id, definition] : (*questions)->items()) {
-            LAYA_TRY(type_value, json_access::at(definition, "type"));
-            LAYA_TRY(type, json_access::string(**type_value));
+            LAYA_TRY(type_value, json_at(definition, "type"));
+            LAYA_TRY(type, json_string(**type_value));
             const auto known = std::ranges::find(question_types, *type);
             if (known == question_types.end()) return rejected("Unsupported question type: " + *type);
             const int kind = int(known - question_types.begin());
             json criteria = field(definition, "criteria");
             LAYA_TRY(texts, options(kind, criteria));
-            LAYA_TRY(instruction, json_access::at(definition, "instructions"));
+            LAYA_TRY(instruction, json_at(definition, "instructions"));
             LAYA_TRY(heading, encode(*type + " question: " + ((*instruction)->is_string() ? (*instruction)->get<std::string>()
                                                                                           : dump_python(**instruction, true))));
             const int count = int(texts->size());
@@ -185,22 +180,39 @@ json inputs(const batch& input) {
             {"lengths", input.lengths}, {"markers", input.markers}, {"counts", input.counts}, {"types", input.types}};
 }
 
-json raw_outputs(const batch& input, const raw_result& output) {
-    return {{"inputs", inputs(input)}, {"logits", output.logits}, {"actions", output.actions},
-            {"action_count", output.action_count}, {"compute_ms", output.compute_ms}};
+result<agent> agent::load(const std::filesystem::path& directory, mode requested, overflow policy) {
+    LAYA_TRY(engine, runtime::load(directory, requested));
+    LAYA_TRY(format, codec::load(engine->model(), policy));
+    return agent{std::move(*engine), std::move(*format)};
 }
 
-json answers(const prepared& questions, const raw_result& output, const serving_config& serving) {
-    const batch& input = questions.input;
+result<json> agent::prepare(const json& requests) const {
+    LAYA_TRY(questions, format.prepare(requests));
+    return inputs(questions->input);
+}
+
+result<json> agent::raw(const json& requests) {
+    LAYA_TRY(questions, format.prepare(requests));
+    LAYA_TRY(output, engine.forward(questions->input));
+    return json{{"inputs", inputs(questions->input)}, {"logits", output->logits}, {"actions", output->actions},
+                {"action_count", output->action_count}, {"compute_ms", output->compute_ms}};
+}
+
+// Calibrated answers: per-type softmax temperature over each question's option logits.
+result<json> agent::predict(const json& requests) {
+    LAYA_TRY(questions, format.prepare(requests));
+    LAYA_TRY(output, engine.forward(questions->input));
+    const batch& input = questions->input;
+    const auto& serving = engine.model().serving;
     auto responses = json::array();
-    for (std::size_t i = 0; i < questions.requests; ++i)
+    for (std::size_t i = 0; i < questions->requests; ++i)
         responses.push_back({{"model", "laya-rl-agent"}, {"answers", json::object()}, {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}});
     std::vector<float> probs;
     for (int row = 0; row < input.size; ++row) {
-        const auto& question = questions.rows[std::size_t(row)];
+        const auto& question = questions->rows[std::size_t(row)];
         const int count = input.counts[row], kind = input.types[row];
         const auto temperature = float(serving.temperature[kind][count <= 2 ? 0 : count <= 5 ? 1 : count <= 10 ? 2 : 3]);
-        probs.assign(output.logits.begin() + std::ptrdiff_t(row) * input.options, output.logits.begin() + std::ptrdiff_t(row) * input.options + count);
+        probs.assign(output->logits.begin() + std::ptrdiff_t(row) * input.options, output->logits.begin() + std::ptrdiff_t(row) * input.options + count);
         for (auto& v : probs) v /= temperature;
         const float maximum = *std::ranges::max_element(probs);
         float total = 0, entropy = 0;
@@ -211,10 +223,10 @@ json answers(const prepared& questions, const raw_result& output, const serving_
             entropy -= probs[k] * std::log(std::max(probs[k], 1e-12f));
             score += k * double(probs[k]);
         }
-        const float* action = output.actions.data() + std::size_t(row) * output.action_count;
-        const float max_action = *std::max_element(action, action + output.action_count);
+        const float* action = output->actions.data() + std::size_t(row) * output->action_count;
+        const float max_action = *std::max_element(action, action + output->action_count);
         float action_sum = 0;
-        for (int k = 0; k < output.action_count; ++k) action_sum += std::exp(action[k] - max_action);
+        for (int k = 0; k < output->action_count; ++k) action_sum += std::exp(action[k] - max_action);
         json answer = {{"type", question_types[kind]}, {"confidence", rounded(std::clamp(1.0 - double(entropy) / std::log(double(count)), 0.0, 1.0))},
                        {"action", {{"act_probability", rounded(std::exp(action[0] - max_action) / action_sum)}}}};
         auto probabilities = json::object();
@@ -245,25 +257,5 @@ json answers(const prepared& questions, const raw_result& output, const serving_
         used = used.get<int>() + input.lengths[row];
     }
     return responses;
-}
-
-result<agent> agent::load(const std::filesystem::path& directory, mode requested, overflow policy) {
-    LAYA_TRY(engine, runtime::load(directory, requested));
-    LAYA_TRY(format, codec::load(engine->model(), policy));
-    return agent(std::move(*engine), std::move(*format));
-}
-result<json> agent::predict(const json& requests) {
-    LAYA_TRY(questions, format.prepare(requests));
-    LAYA_TRY(output, engine.forward(questions->input));
-    return answers(*questions, *output, model().serving);
-}
-result<json> agent::raw(const json& requests) {
-    LAYA_TRY(questions, format.prepare(requests));
-    LAYA_TRY(output, engine.forward(questions->input));
-    return raw_outputs(questions->input, *output);
-}
-result<json> agent::prepare(const json& requests) const {
-    LAYA_TRY(questions, format.prepare(requests));
-    return inputs(questions->input);
 }
 }

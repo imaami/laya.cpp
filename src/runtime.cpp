@@ -29,43 +29,36 @@ const char* laya_cuda_bf16_compatibility_error();
 #include <unordered_map>
 
 namespace laya {
-result<serving_config> serving_config::parse(const json& document) {
-    auto integer = [&](std::string_view key, int fallback) {
-        const json& value = field(document, key);
-        return value.is_null() ? fallback : value.is_number() ? value.get<int>() : 0;
-    };
-    serving_config config;
-    config.variant = field(document, "model_name") == "laya-typed-decisions" ? model_variant::typed_decisions
-                   : field(document, "encoder") == "jhu-clsp/mmBERT-base" ? model_variant::multilingual : model_variant::english;
-    config.max_len = integer("max_len", 512);
-    config.head_max_len = integer("head_max_len", 192);
-    if ((config.max_len != 512 && config.max_len != 1024) || config.head_max_len < 1 || config.head_max_len >= config.max_len)
-        return fail(errc::model, "Unsupported serving sequence limits");
-    // Checkpoints name ({"escalate": 0.5}) or list the action costs; the act_head shape is validated with the weights.
-    const json& costs = field(document, "act_costs");
-    if (costs.is_null()) return fail(errc::model, "Missing act_costs");
-    config.actions = int(costs.size()) + 1;
-    const json &base = field(document, "temperature"), &by_options = field(document, "temperature_by_options");
-    constexpr const char* buckets[] = {"2", "3-5", "6-10", "11+"};
-    for (std::size_t type = 0; type < 3; ++type)
-        for (std::size_t bucket = 0; bucket < 4; ++bucket) {
-            json value = field(by_options, std::string(question_types[type]) + ":" + buckets[bucket]);
-            if (value.is_null()) value = base.is_null() ? json(1) : base.is_array() && type < base.size() ? base[type] : json();
-            if (!value.is_number()) return fail(errc::model, "Unsupported temperature configuration");
-            config.temperature[type][bucket] = std::max(1e-3, value.get<double>());
-        }
-    return config;
+namespace {
+constexpr bool has(mode m, mode bits) { return (m & bits) == bits; }
+// Why a requested mode cannot run, or nullptr. Vendor bits come from the device.
+constexpr const char* rejection(mode m) {
+    using namespace feature;
+    if (has(m, coreml) && (m & (low | flash | compensated)))
+        return "Core ML selects precision and kernels from its compiled model; use --coreml with --fp32 only";
+    if ((m & (fp16 | vulkan)) == fp16) return "FP16 currently requires Vulkan";
+    if ((m & (vulkan | low | flash)) == (vulkan | flash)) return "Vulkan currently supports FP32 without fused attention";
+    if ((m & low) && (has(m, cpu) || (m & (cuda | flash)) == cuda)) return "BF16 mode requires a GPU; CUDA requires fused attention";
+    if (has(m, compensated) && (m & (low | cpu))) return "Compensated matrix operations require a GPU and FP32 mode";
+    return nullptr;
+}
+constexpr architecture large_encoder{1024, 16, 28, 2624, 50368, 10000.f}, multilingual_encoder{768, 12, 22, 1152, 256000, 160000.f};
+constexpr float global_rope = 160000.f;
+constexpr int local_window = 64;  // each side of a sliding-window query
+constexpr bool global_layer(int layer) { return layer % 3 == 0; }  // others slide
 }
 
 result<checkpoint> checkpoint::load(const std::filesystem::path& directory) {
     LAYA_TRY(config, read_json(directory / "rl_agent_config.json"));
     LAYA_TRY(encoder, read_json(directory / "encoder/config.json"));
-    auto integer = [&](std::string_view key) {
-        const json& value = field(*encoder, key);
-        return value.is_number() ? value.get<int>() : 0;
+    const auto integer = [](const json& document, std::string_view key, int fallback = 0) {
+        const json& value = field(document, key);
+        return value.is_null() ? fallback : value.is_number() ? value.get<int>() : 0;
     };
-    architecture arch{integer("hidden_size"), integer("num_attention_heads"), integer("num_hidden_layers"),
-                      integer("intermediate_size"), integer("vocab_size"), 0};
+    checkpoint model{directory, {}, {integer(*encoder, "hidden_size"), integer(*encoder, "num_attention_heads"),
+        integer(*encoder, "num_hidden_layers"), integer(*encoder, "intermediate_size"), integer(*encoder, "vocab_size"), 0}};
+    architecture& arch = model.arch;
+    serving_config& serving = model.serving;
     arch.local_rope = arch.width == multilingual_encoder.width ? multilingual_encoder.local_rope : large_encoder.local_rope;
     if (arch != large_encoder && arch != multilingual_encoder) return fail(errc::model, "Unsupported encoder architecture");
     static const json supported{{"model_type", "modernbert"}, {"local_attention", 128}, {"global_attn_every_n_layers", 3},
@@ -76,16 +69,34 @@ result<checkpoint> checkpoint::load(const std::filesystem::path& directory) {
         return fail(errc::model, "Expected two head layers and BF16 model configuration");
     if (const json& epsilon = field(*encoder, "norm_eps"); !epsilon.is_null() && epsilon != 1e-5)
         return fail(errc::model, "Unsupported normalization epsilon");
-    LAYA_TRY(serving, serving_config::parse(*config));
+    serving.variant = field(*config, "model_name") == "laya-typed-decisions" ? "typed-decisions"
+                    : field(*config, "encoder") == "jhu-clsp/mmBERT-base" ? "multilingual" : "english";
+    serving.max_len = integer(*config, "max_len", 512);
+    serving.head_max_len = integer(*config, "head_max_len", 192);
+    if ((serving.max_len != 512 && serving.max_len != 1024) || serving.head_max_len < 1 || serving.head_max_len >= serving.max_len)
+        return fail(errc::model, "Unsupported serving sequence limits");
+    // Checkpoints name ({"escalate": 0.5}) or list the action costs; the act_head shape is validated with the weights.
+    const json& costs = field(*config, "act_costs");
+    if (costs.is_null()) return fail(errc::model, "Missing act_costs");
+    serving.actions = int(costs.size()) + 1;
+    const json &base = field(*config, "temperature"), &by_options = field(*config, "temperature_by_options");
+    constexpr const char* buckets[] = {"2", "3-5", "6-10", "11+"};
+    for (std::size_t type = 0; type < 3; ++type)
+        for (std::size_t bucket = 0; bucket < 4; ++bucket) {
+            json value = field(by_options, std::string(question_types[type]) + ":" + buckets[bucket]);
+            if (value.is_null()) value = base.is_null() ? json(1) : base.is_array() && type < base.size() ? base[type] : json();
+            if (!value.is_number()) return fail(errc::model, "Unsupported temperature configuration");
+            serving.temperature[type][bucket] = std::max(1e-3, value.get<double>());
+        }
     const json& types = field(*encoder, "layer_types");
     for (int i = 0; i < arch.layers; ++i)
         if (!types.is_array() || i >= int(types.size()) || types[i] != (global_layer(i) ? "full_attention" : "sliding_attention"))
             return fail(errc::model, "Unsupported attention schedule");
     const json& rope = field(*encoder, "rope_parameters");
-    for (auto [kind, base] : {std::pair{"full_attention", architecture::global_rope}, std::pair{"sliding_attention", arch.local_rope}})
+    for (auto [kind, base] : {std::pair{"full_attention", global_rope}, std::pair{"sliding_attention", arch.local_rope}})
         if (field(field(rope, kind), "rope_type") != "default" || field(field(rope, kind), "rope_theta") != double(base))
             return fail(errc::model, "Unsupported rotary configuration");
-    return checkpoint{directory, std::move(*serving), arch};
+    return model;
 }
 
 namespace {
@@ -247,7 +258,7 @@ struct attention_site {
     std::int64_t tokens() const { return std::int64_t(length) * batch; }
     // Fused mixed-precision attention names the masks its kernels must apply.
     const char* masked_kernel() const {
-        if (!head && !global && length >= architecture::local_window) return "laya.sdpa-local";
+        if (!head && !global && length >= local_window) return "laya.sdpa-local";
         return head || padding ? "laya.sdpa-masked" : nullptr;
     }
 };
@@ -422,7 +433,7 @@ struct numerics<M> {
     static tensor* attend(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
         if constexpr (has(M, feature::flash) && !amd) {
             // Unpadded global (or fully windowed) attention needs no mask.
-            if (!at.head && !at.padding && (at.global || at.length < architecture::local_window)) mask = nullptr;
+            if (!at.head && !at.padding && (at.global || at.length < local_window)) mask = nullptr;
             k = ggml_cast(ctx, k, low);
             v = ggml_cast(ctx, v, low);
             return fused_attention(ctx, q, k, v, mask, mask ? at.masked_kernel() : "laya.sdpa-flash", at);
@@ -503,9 +514,9 @@ template<mode M> struct network {
         // so each graph uploads them once.
         std::vector<float> cosine(64 * std::size_t(shape.length)), sine(cosine.size());
         for (int kind = 0; kind < 2; ++kind) {
-            const int base = kind == 0 || arch.local_rope == architecture::global_rope ? 0 : 1;
+            const int base = kind == 0 || arch.local_rope == global_rope ? 0 : 1;
             for (int i = 0; i < 32; ++i) {
-                const float inverse = 1.0f / std::pow(kind == 0 ? architecture::global_rope : arch.local_rope, float(2 * i) / 64.0f);
+                const float inverse = 1.0f / std::pow(kind == 0 ? global_rope : arch.local_rope, float(2 * i) / 64.0f);
                 for (int position = 0; position < shape.length; ++position) {
                     const auto [c, s] = N::rotary(base, inverse, position, i);
                     cosine[position * 64 + i] = cosine[position * 64 + i + 32] = c;
@@ -863,7 +874,7 @@ struct runtime::impl {
     // Vulkan reads host attention masks: 0 where a query may attend a key and
     // -inf elsewhere, including the padded query rows of fused attention.
     template<class T> void upload_masks(const batch& input, std::vector<T>& global, std::vector<T>& local, T open, T closed) {
-        const int length = input.length, rows = int(encoder->global_mask->ne[1]), window = architecture::local_window;
+        const int length = input.length, rows = int(encoder->global_mask->ne[1]), window = local_window;
         global.assign(std::size_t(length) * rows * input.size, closed);
         local.assign(global.size(), closed);
         for (int row = 0; row < input.size; ++row) {
@@ -984,21 +995,20 @@ result<runtime> runtime::load(const std::filesystem::path& directory, mode reque
         return fail(errc::unsupported, "This build has no Core ML backend; rebuild with -DLAYA_COREML=ON on macOS arm64");
     if (const char* reason = rejection(requested)) return fail(errc::unsupported, reason);
     LAYA_TRY(model, checkpoint::load(directory));
-    auto state = std::make_unique<impl>(std::move(*model), requested);
-    if (const char* traces = std::getenv("LAYA_TRACE_DIR")) state->trace_directory = traces;
-    LAYA_CHECK(state->open());
-    if (!std::ranges::contains(modes, state->m)) return fail(errc::unsupported, "Unsupported backend and precision");
-    LAYA_CHECK(dispatch(state->m, [&]<mode M> { return state->template load<M>(); }));
-    return runtime(std::move(state));
+    runtime loaded;
+    loaded.p.reset(new impl{});
+    impl& state = *loaded.p;
+    state.model = std::move(*model);
+    state.m = requested;
+    if (const char* traces = std::getenv("LAYA_TRACE_DIR")) state.trace_directory = traces;
+    LAYA_CHECK(state.open());
+    if (!std::ranges::contains(modes, state.m)) return fail(errc::unsupported, "Unsupported backend and precision");
+    LAYA_CHECK(dispatch(state.m, [&]<mode M> { return state.template load<M>(); }));
+    return loaded;
 }
-result<raw_result> runtime::forward(const batch& input) {
-    return dispatch(p->m, [&]<mode M> { return p->run<M>(input); });
-}
+result<raw_result> runtime::forward(const batch& input) { return dispatch(p->m, [&]<mode M> { return p->run<M>(input); }); }
 const checkpoint& runtime::model() const { return p->model; }
 const std::string& runtime::backend_name() const { return p->name; }
 const std::string& runtime::device_name() const { return p->description; }
-runtime::runtime(std::unique_ptr<impl> state) : p(std::move(state)) {}
-runtime::runtime(runtime&&) noexcept = default;
-runtime& runtime::operator=(runtime&&) noexcept = default;
-runtime::~runtime() = default;
+void runtime::release::operator()(impl* state) const { delete state; }
 }

@@ -98,7 +98,7 @@ void check(const laya::checkpoint& model, const laya::tokenizer& tokenizer) {
     const auto compatibility = expect(laya::codec::load(model, laya::overflow::truncate));
     const auto tokenizer_config = expect(laya::read_json(config_path));
     const auto& sep_setting = laya::field(tokenizer_config, "sep_token");
-    const auto sep_text = expect(laya::json_access::string(sep_setting.is_string() ? sep_setting : laya::field(sep_setting, "content")));
+    const auto sep_text = expect(laya::json_string(sep_setting.is_string() ? sep_setting : laya::field(sep_setting, "content")));
     const auto sep = tokenizer.id(sep_text);
     require(sep.has_value(), "separator token is not in the vocabulary");
     const int sep_id = *sep;
