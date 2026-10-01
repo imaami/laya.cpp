@@ -32,7 +32,7 @@ namespace laya {
 result<serving_config> serving_config::parse(const json& document) {
     auto integer = [&](std::string_view key, int fallback) {
         const json& value = field(document, key);
-        return value.is_null() ? fallback : value.is_number_integer() ? value.get<int>() : 0;
+        return value.is_null() ? fallback : value.is_number() ? value.get<int>() : 0;
     };
     serving_config config;
     config.variant = field(document, "model_name") == "laya-typed-decisions" ? model_variant::typed_decisions
@@ -41,9 +41,9 @@ result<serving_config> serving_config::parse(const json& document) {
     config.head_max_len = integer("head_max_len", 192);
     if ((config.max_len != 512 && config.max_len != 1024) || config.head_max_len < 1 || config.head_max_len >= config.max_len)
         return fail(errc::model, "Unsupported serving sequence limits");
-    // Checkpoints name each action cost ({"escalate": 0.5}); a list is also accepted.
+    // Checkpoints name ({"escalate": 0.5}) or list the action costs; the act_head shape is validated with the weights.
     const json& costs = field(document, "act_costs");
-    if (!costs.is_object() && !costs.is_array()) return fail(errc::model, "Missing act_costs");
+    if (costs.is_null()) return fail(errc::model, "Missing act_costs");
     config.actions = int(costs.size()) + 1;
     const json &base = field(document, "temperature"), &by_options = field(document, "temperature_by_options");
     constexpr const char* buckets[] = {"2", "3-5", "6-10", "11+"};
@@ -62,7 +62,7 @@ result<checkpoint> checkpoint::load(const std::filesystem::path& directory) {
     LAYA_TRY(encoder, read_json(directory / "encoder/config.json"));
     auto integer = [&](std::string_view key) {
         const json& value = field(*encoder, key);
-        return value.is_number_integer() ? value.get<int>() : 0;
+        return value.is_number() ? value.get<int>() : 0;
     };
     architecture arch{integer("hidden_size"), integer("num_attention_heads"), integer("num_hidden_layers"),
                       integer("intermediate_size"), integer("vocab_size"), 0};
