@@ -195,6 +195,7 @@ struct weights {
     std::array<linear, 4> scorer;    // LayerNorm, Linear, GELU, Linear
     std::array<linear, 3> act_head;  // Linear, GELU, Linear
     tensor* gelu_table = nullptr;    // device-generated: Vulkan mixed-precision GELU lookup
+    std::array<tensor*, 2> cosine{}, sine{};  // device-generated: global and local rotary rows of every position
 };
 
 // A checkpoint tensor, its PyTorch shape ({rows} for vectors) and its slot.
@@ -469,7 +470,6 @@ struct graph_shape {
 using trace_list = std::vector<std::pair<std::string, tensor*>>;
 struct compiled_graph {
     context_handle context;
-    allocator_handle allocator;
     ggml_cgraph* graph = nullptr;
 };
 struct encoder_graph : compiled_graph {
@@ -490,13 +490,14 @@ result<void> begin(compiled_graph& g) {
     g.graph = ggml_new_graph_custom(g.context.get(), 8192, false);
     return {};
 }
-// Checks backend support and allocates every intermediate of a built graph.
-result<void> allocate(compiled_graph& g, ggml_backend_t backend) {
+// Checks backend support and allocates every intermediate of a built graph:
+// a fresh plan per graph in device memory that is kept and only ever grows.
+result<void> allocate(compiled_graph& g, ggml_backend_t backend, ggml_gallocr* memory) {
     for (int i = 0; i < ggml_graph_n_nodes(g.graph); ++i)
         if (const auto* node = ggml_graph_node(g.graph, i); !ggml_backend_supports_op(backend, node))
             return fail(errc::unsupported, std::string("Requested backend does not support ") + ggml_op_name(node->op));
-    g.allocator.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)));
-    if (!g.allocator || !ggml_gallocr_alloc_graph(g.allocator.get(), g.graph)) return fail(errc::backend, "Insufficient memory for this batch");
+    if (!ggml_gallocr_reserve(memory, g.graph) || !ggml_gallocr_alloc_graph(memory, g.graph))
+        return fail(errc::backend, "Insufficient memory for this batch");
     return {};
 }
 // Keeps a graph value for LAYA_TRACE_DIR, named scope + layer + suffix.
@@ -516,33 +517,36 @@ template<mode M> struct network {
     const architecture& arch;
     trace_list* traces;  // null unless tracing
 
-    static result<encoder_graph> encoder(ggml_backend_t backend, const weights& w, const architecture& arch, graph_shape shape, bool trace) {
+    static result<encoder_graph> encoder(ggml_backend_t backend, ggml_gallocr* memory, const weights& w, const architecture& arch,
+                                         graph_shape shape, bool trace) {
         encoder_graph g;
         g.shape = shape;
         LAYA_CHECK(begin(g));
         network{g.context.get(), w, arch, trace ? &g.traces : nullptr}.build(g);
-        LAYA_CHECK(allocate(g, backend));
-        // Rotary tables depend on the shape only; as outputs they stay allocated,
-        // so each graph uploads them once.
-        std::vector<float> cosine(64 * std::size_t(shape.length)), sine(cosine.size());
+        LAYA_CHECK(allocate(g, backend, memory));
+        return g;
+    }
+
+    // Rotary rows depend on the position only: computed once for every servable position.
+    static void rotary_tables(const weights& w, const architecture& arch, int positions) {
+        std::vector<float> cosine(64 * std::size_t(positions)), sine(cosine.size());
         for (int kind = 0; kind < 2; ++kind) {
             const int base = kind == 0 || arch.local_rope == global_rope ? 0 : 1;
             for (int i = 0; i < 32; ++i) {
                 const float inverse = 1.0f / std::pow(kind == 0 ? global_rope : arch.local_rope, float(2 * i) / 64.0f);
-                for (int position = 0; position < shape.length; ++position) {
+                for (int position = 0; position < positions; ++position) {
                     const auto [c, s] = N::rotary(base, inverse, position, i);
                     cosine[position * 64 + i] = cosine[position * 64 + i + 32] = c;
                     sine[position * 64 + i] = sine[position * 64 + i + 32] = s;
                 }
             }
-            put(g.cosine[kind], cosine);
-            put(g.sine[kind], sine);
+            put(w.cosine[kind], cosine);
+            put(w.sine[kind], sine);
         }
-        return g;
     }
 
     // The action head over pooled features and option statistics.
-    static result<action_graph> actions(ggml_backend_t backend, const weights& w, const architecture& arch, int batch) {
+    static result<action_graph> actions(ggml_backend_t backend, ggml_gallocr* memory, const weights& w, const architecture& arch, int batch) {
         action_graph g;
         g.batch = batch;
         LAYA_CHECK(begin(g));
@@ -553,7 +557,7 @@ template<mode M> struct network {
         g.output = N::template linear<role::projection>(n.ctx, hidden, head[2].weight, head[2].bias).t;
         ggml_set_output(g.output);
         ggml_build_forward_expand(g.graph, g.output);
-        LAYA_CHECK(allocate(g, backend));
+        LAYA_CHECK(allocate(g, backend, memory));
         return g;
     }
 
@@ -604,10 +608,8 @@ template<mode M> struct network {
         const std::int64_t tokens = std::int64_t(length) * batch;
         g.ids = input(GGML_TYPE_I32, {tokens});
         g.types = input(GGML_TYPE_I32, {tokens});
-        for (int kind = 0; kind < 2; ++kind) {
-            ggml_set_output(g.cosine[kind] = input(GGML_TYPE_F32, {64, 1, length, 1}));
-            ggml_set_output(g.sine[kind] = input(GGML_TYPE_F32, {64, 1, length, 1}));
-        }
+        const auto positions = [&](tensor* table) { return ggml_view_2d(ctx, table, 64, length, table->nb[1], 0); };
+        for (int kind = 0; kind < 2; ++kind) g.cosine[kind] = positions(w.cosine[kind]), g.sine[kind] = positions(w.sine[kind]);
         g.markers = input(GGML_TYPE_I32, {std::int64_t(options) * batch});
         g.cls = input(GGML_TYPE_I32, {batch});
         // Fused attention reads mask query rows in multiples of 64.
@@ -690,6 +692,7 @@ struct runtime::impl {
 #if LAYA_COREML
     std::optional<coreml_runtime> coreml;
 #endif
+    allocator_handle encoder_memory, head_memory;  // device memory of the compiled graphs
     std::optional<encoder_graph> encoder;
     std::optional<action_graph> head;
     // Host staging reused across calls.
@@ -746,7 +749,15 @@ struct runtime::impl {
     }
     template<mode M> requires(has(M, feature::coreml)) result<raw_result> run(const batch& input) { return coreml->forward(input); }
 #endif
-    template<mode M> result<void> load() { return load_weights(numerics<M>::layout); }
+    template<mode M> result<void> load() {
+        LAYA_CHECK(load_weights(numerics<M>::layout));
+        network<M>::rotary_tables(w, model.arch, model.serving.max_len);
+        const auto type = ggml_backend_get_default_buffer_type(backend.get());
+        encoder_memory.reset(ggml_gallocr_new(type));
+        head_memory.reset(ggml_gallocr_new(type));
+        if (!encoder_memory || !head_memory) return fail(errc::backend, "Cannot create graph allocators");
+        return {};
+    }
 
     result<void> load_weights(const storage& layout) {
         std::ifstream file(model.directory / "model.safetensors", std::ios::binary | std::ios::ate);
@@ -771,7 +782,7 @@ struct runtime::impl {
         for (const auto& [key, spec] : header->items())
             if (key != "__metadata__" && !schema.contains(key)) return fail(errc::model, "Unexpected checkpoint tensor: " + key);
 
-        context.reset(ggml_init({(list.size() + 1) * ggml_tensor_overhead() + 1024, nullptr, true}));
+        context.reset(ggml_init({(list.size() + 5) * ggml_tensor_overhead() + 1024, nullptr, true}));
         if (!context) return fail(errc::backend, "Cannot allocate weight metadata");
         // Tensors are created in checkpoint order.
         for (const auto& [key, spec] : header->items()) {
@@ -785,6 +796,10 @@ struct runtime::impl {
             ggml_set_name(*e.slot, key.c_str());
         }
         if (layout.gelu != GGML_TYPE_COUNT) w.gelu_table = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, 65536);
+        for (int kind = 0; kind < 2; ++kind) {
+            w.cosine[kind] = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 64, model.serving.max_len);
+            w.sine[kind] = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 64, model.serving.max_len);
+        }
         buffer.reset(ggml_backend_alloc_ctx_tensors(context.get(), backend.get()));
         if (!buffer) return fail(errc::backend, "Insufficient device memory for model weights");
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -968,12 +983,12 @@ struct runtime::impl {
                                 numerics<M>::mixed && std::ranges::any_of(input.lengths, [&](int n) { return n < input.length; })};
         if (!encoder || encoder->shape != shape) {
             encoder.reset();
-            LAYA_TRY(graph, network<M>::encoder(backend.get(), w, model.arch, shape, !trace_directory.empty()));
+            LAYA_TRY(graph, network<M>::encoder(backend.get(), encoder_memory.get(), w, model.arch, shape, !trace_directory.empty()));
             encoder.emplace(std::move(*graph));
         }
         if (!head || head->batch != input.size) {
             head.reset();
-            LAYA_TRY(graph, network<M>::actions(backend.get(), w, model.arch, input.size));
+            LAYA_TRY(graph, network<M>::actions(backend.get(), head_memory.get(), w, model.arch, input.size));
             head.emplace(std::move(*graph));
         }
         bind(input);
