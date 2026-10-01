@@ -148,7 +148,7 @@ template<class Values> void put(tensor* t, const Values& values) { ggml_backend_
 // IEEE magnitudes as bits order like the values; nonfinite values have every exponent bit set.
 constexpr std::int32_t infinity(ggml_type type) { return type == GGML_TYPE_F32 ? 0x7f800000 : type == GGML_TYPE_F16 ? 0x7c00 : 0x7f80; }
 // The largest magnitude bits of an F32 or 16-bit payload: a branch-free reduction compilers vectorize.
-template<class T> std::int32_t largest_magnitude(const std::vector<T>& payload) {
+template<class T> std::int32_t largest_magnitude(std::span<const T> payload) {
     using bits = std::conditional_t<sizeof(T) == 4, std::int32_t, std::int16_t>;
     bits largest = 0;
     for (const T x : payload) largest = std::max<bits>(largest, std::bit_cast<bits>(x) & std::numeric_limits<bits>::max());
@@ -789,15 +789,16 @@ struct runtime::impl {
         if (!buffer) return fail(errc::backend, "Insufficient device memory for model weights");
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        // Payloads are validated and uploaded in name order. A payload already in
-        // its device type is uploaded as read; others convert exactly through FP32.
+        // Payloads are validated and uploaded in name order, in bounded chunks. A payload
+        // already in its device type is uploaded as read; others convert exactly through FP32.
         std::vector<const entry*> order;
         for (const auto& e : list) order.push_back(&e);
         std::ranges::sort(order, {}, &entry::name);
         const std::uint64_t payload_size = file_size - 8 - header_size;
-        std::vector<std::uint16_t> half;  // 16-bit payloads and device values
-        std::vector<float> values;        // F32 payloads and widened values
-        std::bitset<32768> exact;         // BF16 magnitudes AMD kernels convert exactly to F16
+        constexpr std::size_t chunk = std::size_t(1) << 22;  // elements per transfer
+        std::vector<std::uint16_t> half(chunk);  // 16-bit payloads and device values
+        std::vector<float> values(chunk);        // F32 payloads and widened values
+        std::bitset<32768> exact;                // BF16 magnitudes AMD kernels convert exactly to F16
         if (layout.amd_bf16_range)
             for (uint magnitude = 0; magnitude < exact.size(); ++magnitude) exact[magnitude] = layaBf16ScaledFitsHalf(magnitude, 0);
         for (const auto* e : order) {
@@ -810,28 +811,34 @@ struct runtime::impl {
             const auto begin = valid ? offsets[0].get<std::uint64_t>() : 0, end = valid ? offsets[1].get<std::uint64_t>() : 0;
             if (!valid || source == GGML_TYPE_COUNT || end < begin || end > payload_size || end - begin != count * ggml_type_size(source))
                 return fail(errc::model, "Invalid safetensors payload: " + e->name);
-            const bool wide = source == GGML_TYPE_F32;
-            wide ? values.resize(count) : half.resize(count);
+            const bool wide = source == GGML_TYPE_F32, rounded_bias = e->kind == role::bias && layout.bias != GGML_TYPE_F32;
+            bool finite = true, in_range = true;  // reported once the whole payload is read
             file.seekg(std::streamoff(8 + header_size + begin));
-            file.read(wide ? reinterpret_cast<char*>(values.data()) : reinterpret_cast<char*>(half.data()), std::streamsize(end - begin));
-            if (!file) return fail(errc::model, "Truncated tensor payload: " + e->name);
-            if ((wide ? largest_magnitude<float>(values) : largest_magnitude<std::uint16_t>(half)) >= infinity(source))
-                return fail(errc::model, "Nonfinite checkpoint values: " + e->name);
-            const bool rounded_bias = e->kind == role::bias && layout.bias != GGML_TYPE_F32;
-            if (t->type != source || rounded_bias) {
-                if (source == GGML_TYPE_F16) values.resize(count), ggml_fp16_to_fp32_row(half.data(), values.data(), std::int64_t(count));
-                if (source == GGML_TYPE_BF16) values.resize(count), ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t*>(half.data()), values.data(), std::int64_t(count));
-                if (rounded_bias && layout.bias == GGML_TYPE_F16)
-                    for (auto& x : values) x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
-                if (rounded_bias && layout.bias == GGML_TYPE_BF16)
-                    for (auto& x : values) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
-                if (t->type != GGML_TYPE_F32) half.resize(count);
-                if (t->type == GGML_TYPE_F16) ggml_fp32_to_fp16_row(values.data(), half.data(), std::int64_t(count));
-                if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(values.data(), reinterpret_cast<ggml_bf16_t*>(half.data()), std::int64_t(count));
+            for (std::size_t done = 0; done < count; done += chunk) {
+                const std::size_t n = std::min(chunk, count - done);
+                const std::span<float> wide_part(values.data(), n);
+                const std::span<std::uint16_t> half_part(half.data(), n);
+                file.read(wide ? reinterpret_cast<char*>(values.data()) : reinterpret_cast<char*>(half.data()), std::streamsize(n * ggml_type_size(source)));
+                if (!file) return fail(errc::model, "Truncated tensor payload: " + e->name);
+                finite &= (wide ? largest_magnitude<float>(wide_part) : largest_magnitude<std::uint16_t>(half_part)) < infinity(source);
+                if (t->type != source || rounded_bias) {
+                    const auto* bf16 = reinterpret_cast<ggml_bf16_t*>(half.data());
+                    if (source == GGML_TYPE_F16) ggml_fp16_to_fp32_row(half.data(), values.data(), std::int64_t(n));
+                    if (source == GGML_TYPE_BF16) ggml_bf16_to_fp32_row(bf16, values.data(), std::int64_t(n));
+                    if (rounded_bias && layout.bias == GGML_TYPE_F16)
+                        for (auto& x : wide_part) x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
+                    if (rounded_bias && layout.bias == GGML_TYPE_BF16)
+                        for (auto& x : wide_part) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
+                    if (t->type == GGML_TYPE_F16) ggml_fp32_to_fp16_row(values.data(), half.data(), std::int64_t(n));
+                    if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(values.data(), reinterpret_cast<ggml_bf16_t*>(half.data()), std::int64_t(n));
+                }
+                if (layout.amd_bf16_range && t->type == GGML_TYPE_BF16)
+                    in_range &= std::ranges::all_of(half_part, [&](std::uint16_t x) { return exact[x & 0x7fff]; });
+                const std::size_t size = ggml_type_size(t->type);
+                ggml_backend_tensor_set(t, t->type == GGML_TYPE_F32 ? static_cast<void*>(values.data()) : half.data(), done * size, n * size);
             }
-            if (layout.amd_bf16_range && t->type == GGML_TYPE_BF16 && !std::ranges::all_of(half, [&](std::uint16_t x) { return exact[x & 0x7fff]; }))
-                return fail(errc::model, "AMD Vulkan BF16 projection weights exceed exact conversion range: " + e->name);
-            t->type == GGML_TYPE_F32 ? put(t, values) : put(t, half);
+            if (!finite) return fail(errc::model, "Nonfinite checkpoint values: " + e->name);
+            if (!in_range) return fail(errc::model, "AMD Vulkan BF16 projection weights exceed exact conversion range: " + e->name);
         }
         if (auto* table = w.gelu_table) {
             using namespace vulkan_precision;
