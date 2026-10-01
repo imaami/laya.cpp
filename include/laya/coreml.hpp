@@ -1,7 +1,5 @@
 #pragma once
-#include "laya/batch.hpp"
-#include "laya/checkpoint.hpp"
-#include "laya/error.hpp"
+#include "laya/runtime.hpp"
 #include <memory>
 
 namespace laya {

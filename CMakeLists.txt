@@ -132,8 +132,7 @@ target_compile_options(laya-options INTERFACE
 target_compile_definitions(laya-options INTERFACE JSON_NOEXCEPTION CPPHTTPLIB_NO_EXCEPTIONS
   $<$<CXX_COMPILER_ID:MSVC>:_HAS_EXCEPTIONS=0>
   LAYA_CUDA=$<BOOL:${LAYA_CUDA}> LAYA_VULKAN=$<BOOL:${LAYA_VULKAN}> LAYA_COREML=$<BOOL:${LAYA_COREML}>)
-add_library(laya src/checkpoint.cpp src/decision.cpp src/device.cpp src/json.cpp src/precision.cpp src/protocol.cpp
-  src/tokenizer.cpp src/weights.cpp)
+add_library(laya src/decision.cpp src/json.cpp src/precision.cpp src/protocol.cpp src/runtime.cpp src/tokenizer.cpp)
 target_include_directories(laya PUBLIC include PRIVATE src)
 target_compile_options(laya PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra;-Wpedantic>)
 target_link_libraries(laya PUBLIC laya-options ggml nlohmann_json::nlohmann_json ICU::i18n ICU::uc ICU::data ${CMAKE_DL_LIBS})

@@ -1,9 +1,7 @@
 #include "check.hpp"
-#include "laya/checkpoint.hpp"
-#include "laya/protocol.hpp"
+#include "laya/runtime.hpp"
 #include <algorithm>
 #include <iostream>
-#include <variant>
 
 namespace {
 using laya::json;
@@ -20,13 +18,11 @@ json request(json state, json questions) {
 }
 
 // The model inputs of a request, as --prepare prints them.
-template<class Codec>
-json prepare(const Codec& codec, const json& input) {
+json prepare(const laya::codec& codec, const json& input) {
     return laya::inputs(expect(codec.prepare(input)).input);
 }
 
-template<class Codec>
-void rejects(const Codec& codec, const json& input, const std::string& fragment) {
+void rejects(const laya::codec& codec, const json& input, const std::string& fragment) {
     auto outcome = codec.prepare(input);
     if (outcome) fail("strict preparation accepted input expected to be rejected: " + fragment);
     const auto& message = outcome.error().message;
@@ -44,13 +40,11 @@ std::string repeated(const std::string& phrase, int count) {
     return result;
 }
 
-template<class Tokenizer>
-std::size_t encoded_size(const Tokenizer& tokenizer, const std::string& text) {
+std::size_t encoded_size(const laya::tokenizer& tokenizer, const std::string& text) {
     return expect(tokenizer.encode(text)).size();
 }
 
-template<class Tokenizer>
-std::string value_for_option_tokens(const Tokenizer& tokenizer, const std::string& label,
+std::string value_for_option_tokens(const laya::tokenizer& tokenizer, const std::string& label,
                                     const std::string& word, int target) {
     for (int count = 1; count <= target * 3; ++count) {
         const auto candidate = repeated(word, count);
@@ -59,8 +53,7 @@ std::string value_for_option_tokens(const Tokenizer& tokenizer, const std::strin
     fail("could not construct an option with the requested exact token count");
 }
 
-template<class Tokenizer>
-std::string phrase_with_exact_tokens(const Tokenizer& tokenizer, const std::string& word, int target) {
+std::string phrase_with_exact_tokens(const laya::tokenizer& tokenizer, const std::string& word, int target) {
     for (int count = 1; count <= target * 3; ++count) {
         const auto candidate = repeated(word, count);
         if (encoded_size(tokenizer, " " + candidate) == static_cast<size_t>(target)) return candidate;
@@ -97,15 +90,12 @@ int exact_fit_count(int head_budget) {
     return 0;
 }
 
-template<laya::text_tokenizer Tokenizer>
-void check(const laya::checkpoint& model, const Tokenizer& tokenizer) {
+void check(const laya::checkpoint& model, const laya::tokenizer& tokenizer) {
     const int max_len = model.serving.max_len;
     const int head_budget = model.serving.head_max_len;
     const auto config_path = model.directory / "tokenizer/tokenizer_config.json";
-    // Each codec owns its tokenizer.
-    auto reload = [&] { return std::get<Tokenizer>(expect(laya::load_tokenizer(model.directory / "tokenizer/tokenizer.json"))); };
-    const auto strict = expect(laya::codec<Tokenizer, laya::overflow::reject>::load(reload(), config_path, model.serving));
-    const auto compatibility = expect(laya::codec<Tokenizer, laya::overflow::truncate>::load(reload(), config_path, model.serving));
+    const auto strict = expect(laya::codec::load(model, laya::overflow::reject));
+    const auto compatibility = expect(laya::codec::load(model, laya::overflow::truncate));
     const auto tokenizer_config = expect(laya::read_json(config_path));
     const auto& sep_setting = laya::field(tokenizer_config, "sep_token");
     const auto sep_text = expect(laya::json_access::string(sep_setting.is_string() ? sep_setting : laya::field(sep_setting, "content")));
@@ -208,7 +198,6 @@ void check(const laya::checkpoint& model, const Tokenizer& tokenizer) {
 int main(int argc, char** argv) {
     if (argc != 2) fail("usage: test-request-preparation MODEL_DIR");
     const auto model = expect(laya::checkpoint::load(argv[1]));
-    const auto tokenizer = expect(laya::load_tokenizer(model.directory / "tokenizer/tokenizer.json"));
-    std::visit([&](const auto& text) { check(model, text); }, tokenizer);
+    check(model, expect(laya::tokenizer::load(model.directory / "tokenizer/tokenizer.json")));
     std::cout << "request preparation truncation cases passed\n";
 }
