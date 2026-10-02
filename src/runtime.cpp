@@ -145,6 +145,28 @@ template<std::size_t I = 0, class F> dispatched<F> dispatch(mode m, F&& f) {
 }
 
 template<class Values> void put(tensor* t, const Values& values) { ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t)); }
+// A call's transfer memory, handed out to graph inputs and outputs in order.
+// Copies are queued: received values are valid once the backend synchronizes.
+struct transfer {
+    ggml_backend_t backend;
+    std::byte* next;
+    template<class T> std::span<T> take(const tensor* t) {
+        const std::span<T> host(reinterpret_cast<T*>(next), ggml_nbytes(t) / sizeof(T));
+        next += GGML_PAD(ggml_nbytes(t), 64);
+        return host;
+    }
+    template<class T> void send(tensor* t, std::span<T> host) { ggml_backend_tensor_set_async(backend, t, host.data(), 0, host.size_bytes()); }
+    template<class T> void send(tensor* t, const std::vector<T>& values) {
+        const auto host = take<T>(t);
+        std::ranges::copy(values, host.begin());
+        send(t, host);
+    }
+    template<class T> std::span<T> receive(const tensor* t) {
+        const auto host = take<T>(t);
+        ggml_backend_tensor_get_async(backend, t, host.data(), 0, host.size_bytes());
+        return host;
+    }
+};
 // IEEE magnitudes as bits order like the values; nonfinite values have every exponent bit set.
 constexpr std::int32_t infinity(ggml_type type) { return type == GGML_TYPE_F32 ? 0x7f800000 : type == GGML_TYPE_F16 ? 0x7c00 : 0x7f80; }
 // The largest magnitude bits of an F32 or 16-bit payload: a branch-free reduction compilers vectorize.
@@ -695,10 +717,25 @@ struct runtime::impl {
     allocator_handle encoder_memory, head_memory;  // device memory of the compiled graphs
     std::optional<encoder_graph> encoder;
     std::optional<action_graph> head;
-    // Host staging reused across calls.
-    std::vector<std::int32_t> types, cls;
-    std::vector<float> pooled, features, probabilities, global_mask, local_mask;
-    std::vector<ggml_fp16_t> global_half, local_half;
+    // Host memory the device copies to and from directly: pinned when the device
+    // offers it, so copies queue with other work instead of each awaiting the device.
+    buffer_handle transfer_buffer;
+    std::vector<float> probabilities;
+
+    ~impl() {
+        if (backend) ggml_backend_synchronize(backend.get());  // queued copies read transfer memory
+    }
+    // Transfer memory of at least the given size; queued copies complete before it moves.
+    std::byte* transfer_memory(std::size_t bytes) {
+        if (!transfer_buffer || ggml_backend_buffer_get_size(transfer_buffer.get()) < bytes) {
+            ggml_backend_synchronize(backend.get());
+            transfer_buffer.reset();
+            auto* type = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend.get()));
+            transfer_buffer.reset(ggml_backend_buft_alloc_buffer(type ? type : ggml_backend_cpu_buffer_type(), bytes));
+            if (!transfer_buffer) return nullptr;
+        }
+        return static_cast<std::byte*>(ggml_backend_buffer_get_base(transfer_buffer.get()));
+    }
 
     // Initializes the device; Vulkan mixed precision adds the vendor bits of the
     // reference numerics it matches.
@@ -810,9 +847,12 @@ struct runtime::impl {
         for (const auto& e : list) order.push_back(&e);
         std::ranges::sort(order, {}, &entry::name);
         const std::uint64_t payload_size = file_size - 8 - header_size;
-        constexpr std::size_t chunk = std::size_t(1) << 22;  // elements per transfer
+        constexpr std::size_t chunk = std::size_t(1) << 22, capacity = chunk * sizeof(float);  // elements and bytes per transfer
+        std::byte* const staged = transfer_memory(capacity);
+        if (!staged) return fail(errc::backend, "Cannot allocate transfer memory");
         std::vector<std::uint16_t> half(chunk);  // 16-bit payloads and device values
         std::vector<float> values(chunk);        // F32 payloads and widened values
+        std::size_t queued = 0;                  // transfer memory read by queued copies
         std::bitset<32768> exact;                // BF16 magnitudes AMD kernels convert exactly to F16
         if (layout.amd_bf16_range)
             for (uint magnitude = 0; magnitude < exact.size(); ++magnitude) exact[magnitude] = layaBf16ScaledFitsHalf(magnitude, 0);
@@ -827,34 +867,39 @@ struct runtime::impl {
             if (!valid || source == GGML_TYPE_COUNT || end < begin || end > payload_size || end - begin != count * ggml_type_size(source))
                 return fail(errc::model, "Invalid safetensors payload: " + e->name);
             const bool wide = source == GGML_TYPE_F32, rounded_bias = e->kind == role::bias && layout.bias != GGML_TYPE_F32;
+            const std::size_t size = ggml_type_size(t->type);
             bool finite = true, in_range = true;  // reported once the whole payload is read
             file.seekg(std::streamoff(8 + header_size + begin));
             for (std::size_t done = 0; done < count; done += chunk) {
                 const std::size_t n = std::min(chunk, count - done);
-                const std::span<float> wide_part(values.data(), n);
-                const std::span<std::uint16_t> half_part(half.data(), n);
-                file.read(wide ? reinterpret_cast<char*>(values.data()) : reinterpret_cast<char*>(half.data()), std::streamsize(n * ggml_type_size(source)));
+                if (queued + n * size > capacity) ggml_backend_synchronize(backend.get()), queued = 0;
+                // Device values are built in transfer memory.
+                std::byte* device = staged + queued;
+                const std::span wide_part(t->type == GGML_TYPE_F32 ? reinterpret_cast<float*>(device) : values.data(), n);
+                const std::span half_part(t->type == GGML_TYPE_F32 ? half.data() : reinterpret_cast<std::uint16_t*>(device), n);
+                auto* bf16 = reinterpret_cast<ggml_bf16_t*>(half_part.data());
+                file.read(wide ? reinterpret_cast<char*>(wide_part.data()) : reinterpret_cast<char*>(half_part.data()), std::streamsize(n * ggml_type_size(source)));
                 if (!file) return fail(errc::model, "Truncated tensor payload: " + e->name);
                 finite &= (wide ? largest_magnitude<float>(wide_part) : largest_magnitude<std::uint16_t>(half_part)) < infinity(source);
                 if (t->type != source || rounded_bias) {
-                    const auto* bf16 = reinterpret_cast<ggml_bf16_t*>(half.data());
-                    if (source == GGML_TYPE_F16) ggml_fp16_to_fp32_row(half.data(), values.data(), std::int64_t(n));
-                    if (source == GGML_TYPE_BF16) ggml_bf16_to_fp32_row(bf16, values.data(), std::int64_t(n));
+                    if (source == GGML_TYPE_F16) ggml_fp16_to_fp32_row(half_part.data(), wide_part.data(), std::int64_t(n));
+                    if (source == GGML_TYPE_BF16) ggml_bf16_to_fp32_row(bf16, wide_part.data(), std::int64_t(n));
                     if (rounded_bias && layout.bias == GGML_TYPE_F16)
                         for (auto& x : wide_part) x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
                     if (rounded_bias && layout.bias == GGML_TYPE_BF16)
                         for (auto& x : wide_part) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
-                    if (t->type == GGML_TYPE_F16) ggml_fp32_to_fp16_row(values.data(), half.data(), std::int64_t(n));
-                    if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(values.data(), reinterpret_cast<ggml_bf16_t*>(half.data()), std::int64_t(n));
+                    if (t->type == GGML_TYPE_F16) ggml_fp32_to_fp16_row(wide_part.data(), half_part.data(), std::int64_t(n));
+                    if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(wide_part.data(), bf16, std::int64_t(n));
                 }
                 if (layout.amd_bf16_range && t->type == GGML_TYPE_BF16)
                     in_range &= std::ranges::all_of(half_part, [&](std::uint16_t x) { return exact[x & 0x7fff]; });
-                const std::size_t size = ggml_type_size(t->type);
-                ggml_backend_tensor_set(t, t->type == GGML_TYPE_F32 ? static_cast<void*>(values.data()) : half.data(), done * size, n * size);
+                ggml_backend_tensor_set_async(backend.get(), t, device, done * size, n * size);
+                queued += GGML_PAD(n * size, 64);
             }
             if (!finite) return fail(errc::model, "Nonfinite checkpoint values: " + e->name);
             if (!in_range) return fail(errc::model, "AMD Vulkan BF16 projection weights exceed exact conversion range: " + e->name);
         }
+        ggml_backend_synchronize(backend.get());
         if (auto* table = w.gelu_table) {
             using namespace vulkan_precision;
             const bool half = layout.gelu == GGML_TYPE_F16;
@@ -891,25 +936,25 @@ struct runtime::impl {
         return {};
     }
 
-    void bind(const batch& input) {
-        put(encoder->ids, input.ids);
-        put(encoder->markers, input.markers);
-        types.resize(input.ids.size());
-        cls.resize(std::size_t(input.size));
+    void bind(const batch& input, transfer& io) {
+        io.send(encoder->ids, input.ids);
+        io.send(encoder->markers, input.markers);
+        const auto types = io.take<std::int32_t>(encoder->types), cls = io.take<std::int32_t>(encoder->cls);
         for (int row = 0; row < input.size; ++row) {
             cls[row] = row * input.length;
             std::fill_n(types.begin() + cls[row], input.length, input.types[row]);
         }
-        put(encoder->types, types);
-        put(encoder->cls, cls);
+        io.send(encoder->types, types);
+        io.send(encoder->cls, cls);
     }
 
     // Vulkan reads host attention masks: 0 where a query may attend a key and
     // -inf elsewhere, including the padded query rows of fused attention.
-    template<class T> void upload_masks(const batch& input, std::vector<T>& global, std::vector<T>& local, T open, T closed) {
+    template<class T> void send_masks(const batch& input, transfer& io, T open, T closed) {
         const int length = input.length, rows = int(encoder->global_mask->ne[1]), window = local_window;
-        global.assign(std::size_t(length) * rows * input.size, closed);
-        local.assign(global.size(), closed);
+        const auto global = io.take<T>(encoder->global_mask), local = io.take<T>(encoder->local_mask);
+        std::ranges::fill(global, closed);
+        std::ranges::fill(local, closed);
         for (int row = 0; row < input.size; ++row) {
             const int valid = input.lengths[row];
             for (int query = 0; query < length; ++query) {
@@ -920,16 +965,15 @@ struct runtime::impl {
                 if (query >= valid + window) local[base] = open;  // beyond every valid key's window: attend the first token
             }
         }
-        put(encoder->global_mask, global);
-        if (encoder->local_mask->buffer) put(encoder->local_mask, local);  // unused by unpadded short fused attention
+        io.send(encoder->global_mask, global);
+        if (encoder->local_mask->buffer) io.send(encoder->local_mask, local);  // unused by unpadded short fused attention
     }
 
     // Action-head features per row: pooled state, then the top probability,
     // its margin, normalized entropy and option count of the option softmax.
     // Logits of padded options are set to -1e4 in place.
-    void summarize(const batch& input, std::vector<float>& logits) {
+    void summarize(const batch& input, std::span<float> logits, std::span<const float> pooled, std::span<float> features) {
         const int width = model.arch.width;
-        features.resize(std::size_t(width + 4) * input.size);
         probabilities.resize(std::size_t(input.options));
         for (int row = 0; row < input.size; ++row) {
             auto* out = features.data() + std::size_t(row) * (width + 4);
@@ -971,7 +1015,7 @@ struct runtime::impl {
     template<mode M> result<raw_result> run(const batch& input) {
         // AMD Vulkan BF16 kernels flag nonfinite projection inputs on the device.
         constexpr bool checked = has(M, feature::vulkan | feature::bf16 | feature::amd);
-        const auto check = [&](const std::vector<float>& values) -> result<void> {
+        const auto check = [&](std::span<const float> values) -> result<void> {
             if constexpr (checked) {
                 if (laya_vk_bf16_status_failed(backend.get())) return fail(errc::backend, "Nonfinite AMD Vulkan BF16 projection input");
                 if (!std::ranges::all_of(values, [](float x) { return std::isfinite(x); })) return fail(errc::backend, "Nonfinite AMD Vulkan BF16 output");
@@ -991,32 +1035,41 @@ struct runtime::impl {
             LAYA_TRY(graph, network<M>::actions(backend.get(), head_memory.get(), w, model.arch, input.size));
             head.emplace(std::move(*graph));
         }
-        bind(input);
+        if constexpr (checked) laya_vk_bf16_status_reset(backend.get());  // synchronizes, so before any copy is queued
+        // Inputs and outputs pass through transfer memory: their copies queue with
+        // each graph, and the device is awaited once per graph.
+        std::size_t bytes = 0;
+        for (const tensor* t : {encoder->ids, encoder->types, encoder->markers, encoder->cls, encoder->lengths, encoder->global_mask,
+                                encoder->local_mask, encoder->logits, encoder->pooled, head->input, head->output})
+            if (t && (t->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT))) bytes += GGML_PAD(ggml_nbytes(t), 64);
+        transfer io{backend.get(), transfer_memory(bytes)};
+        if (!io.next) return fail(errc::backend, "Cannot allocate transfer memory");
+        bind(input, io);
         if constexpr (has(M, feature::vulkan | feature::flash))
-            upload_masks(input, global_half, local_half, ggml_fp32_to_fp16(0.0f), ggml_fp32_to_fp16(-INFINITY));
+            send_masks(input, io, ggml_fp32_to_fp16(0.0f), ggml_fp32_to_fp16(-INFINITY));
         else if constexpr (has(M, feature::vulkan))
-            upload_masks(input, global_mask, local_mask, 0.0f, -INFINITY);
+            send_masks(input, io, 0.0f, -INFINITY);
         else
-            put(encoder->lengths, input.lengths);
+            io.send(encoder->lengths, input.lengths);
 
         const auto start = std::chrono::steady_clock::now();
-        if constexpr (checked) laya_vk_bf16_status_reset(backend.get());
-        if (ggml_backend_graph_compute(backend.get(), encoder->graph) != GGML_STATUS_SUCCESS) return fail(errc::backend, "Encoder computation failed");
-        raw_result output;
-        output.action_count = model.serving.actions;
-        output.logits.resize(std::size_t(input.size) * input.options);
-        pooled.resize(std::size_t(model.arch.width) * input.size);
-        ggml_backend_tensor_get(encoder->logits, output.logits.data(), 0, ggml_nbytes(encoder->logits));
-        ggml_backend_tensor_get(encoder->pooled, pooled.data(), 0, ggml_nbytes(encoder->pooled));
+        auto status = ggml_backend_graph_compute_async(io.backend, encoder->graph);
+        const auto logits = io.receive<float>(encoder->logits), pooled = io.receive<float>(encoder->pooled);
+        ggml_backend_synchronize(io.backend);
+        if (status != GGML_STATUS_SUCCESS) return fail(errc::backend, "Encoder computation failed");
+        raw_result output{{logits.begin(), logits.end()}, {}, model.serving.actions};
         LAYA_CHECK(check(output.logits));
         LAYA_CHECK(check(pooled));
         if (!trace_directory.empty()) write_traces();
 
-        summarize(input, output.logits);
-        put(head->input, features);
-        if (ggml_backend_graph_compute(backend.get(), head->graph) != GGML_STATUS_SUCCESS) return fail(errc::backend, "Action computation failed");
-        output.actions.resize(std::size_t(input.size) * output.action_count);
-        ggml_backend_tensor_get(head->output, output.actions.data(), 0, ggml_nbytes(head->output));
+        const auto features = io.take<float>(head->input);
+        summarize(input, output.logits, pooled, features);
+        io.send(head->input, features);
+        status = ggml_backend_graph_compute_async(io.backend, head->graph);
+        const auto actions = io.receive<float>(head->output);
+        ggml_backend_synchronize(io.backend);
+        if (status != GGML_STATUS_SUCCESS) return fail(errc::backend, "Action computation failed");
+        output.actions.assign(actions.begin(), actions.end());
         LAYA_CHECK(check(output.actions));
         output.compute_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         return output;
