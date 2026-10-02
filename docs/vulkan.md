@@ -91,6 +91,15 @@ attention and empty masked rows on both tested GPUs. The NVIDIA 16-bit profile u
 uses separate QK, softmax and probability/value kernels with measured rounding
 orders.
 
+When 16-bit attention runs as separate products, the Q/K/V pack also writes V
+transposed for the probability/value product. On AMD it writes Q and K already
+scaled by 8^-1/2, with the rounding `ggml_scale` applies. A single pass then
+merges the heads into token rows rounded for the output projection, replacing
+the separate scale, transpose, permute and rounding passes. Operator tests check
+that this produces the same attention output bits as the separate passes.
+`GGML_VK_PERF_LOGGER=1` reports Laya operators by name, and every operator with
+its output shape.
+
 Dense FP32 attention uses more memory than fused attention at long sequence
 lengths. Begin with the default eight-question HTTP limit and reduce it on
 smaller GPUs. Cold calls also include Vulkan shader/pipeline creation; benchmark

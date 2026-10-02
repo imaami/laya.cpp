@@ -99,3 +99,7 @@ inference worker combines calls and runs the resident agent serially. `/v1/syste
 For layer diagnostics, set `LAYA_TRACE_DIR` to an output directory. Intermediate
 FP32 tensors are written as row-major `.f32` files after inference. This mode
 retains additional activations and is unsuitable for performance measurement.
+In AMD-matched Vulkan 16-bit attention, the `.q` and `.k` traces hold the operands
+already scaled by 8^-1/2. In 16-bit Vulkan attention that runs as separate
+products, `.attn.Wo.input` holds the merged heads already rounded to storage
+precision.
