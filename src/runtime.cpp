@@ -825,6 +825,8 @@ struct runtime::impl {
 
         // Payloads are validated and uploaded in bounded chunks. A payload already
         // in its device type is uploaded as read; others convert exactly through FP32.
+        // F16 conversions use the CPU backend's vector routines, which round like
+        // the scalar ggml-base routines for every non-NaN value.
         const std::uint64_t payload_size = file_size - 8 - header_size;
         constexpr std::size_t chunk = std::size_t(1) << 22, capacity = chunk * sizeof(float);  // elements and bytes per transfer
         std::byte* const staged = transfer_memory(capacity);
@@ -861,13 +863,13 @@ struct runtime::impl {
                 if (!file) return fail(errc::model, "Truncated tensor payload: " + e.name);
                 finite &= (wide ? largest_magnitude<float>(wide_part) : largest_magnitude<std::uint16_t>(half_part)) < infinity(source);
                 if (t->type != source || rounded_bias) {
-                    if (source == GGML_TYPE_F16) ggml_fp16_to_fp32_row(half_part.data(), wide_part.data(), std::int64_t(n));
+                    if (source == GGML_TYPE_F16) ggml_cpu_fp16_to_fp32(half_part.data(), wide_part.data(), std::int64_t(n));
                     if (source == GGML_TYPE_BF16) ggml_bf16_to_fp32_row(bf16, wide_part.data(), std::int64_t(n));
                     if (rounded_bias && layout.projection == GGML_TYPE_F16)
                         for (auto& x : wide_part) x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
                     if (rounded_bias && layout.projection == GGML_TYPE_BF16)
                         for (auto& x : wide_part) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
-                    if (t->type == GGML_TYPE_F16) ggml_fp32_to_fp16_row(wide_part.data(), half_part.data(), std::int64_t(n));
+                    if (t->type == GGML_TYPE_F16) ggml_cpu_fp32_to_fp16(wide_part.data(), half_part.data(), std::int64_t(n));
                     if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(wide_part.data(), bf16, std::int64_t(n));
                 }
                 if (layout.amd_bf16_range && t->type == GGML_TYPE_BF16)
