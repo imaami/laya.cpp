@@ -12,7 +12,7 @@ foreach(mask_type f32 f16)
       -DA_TYPE=float -DB_TYPE=${laya_amd_mask_type} -DD_TYPE=float
       -I${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-vulkan/vulkan-shaders
       "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/softmax_amd.comp" -o "${laya_amd_softmax_header}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/softmax_amd.comp"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/softmax_amd.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/rocm_math.glsl"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl" VERBATIM)
   add_custom_target(laya-vulkan-amd-softmax-${mask_type} DEPENDS "${laya_amd_softmax_header}")
   add_dependencies(ggml-vulkan laya-vulkan-amd-softmax-${mask_type})

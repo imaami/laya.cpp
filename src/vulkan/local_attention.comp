@@ -1,0 +1,160 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// Sliding-window attention for 32 consecutive queries of one head of one
+// sequence. Each query attends the keys within WINDOW of it among the
+// sequence's valid tokens; a padded query beyond all of them attends the
+// first key alone (mask.comp, local flag). Every value rounds as in the
+// separate AMD-matched products: score FMAs in dimension order, softmax_amd.comp's
+// slot sums and reduction tree, and the probability/value key order of
+// laya_amd_attention (natural, or from key 64 for the upper 32 dimensions once
+// 128 keys fill its blocks). Keys outside a query's window have probability
+// zero there and are skipped.
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+layout(binding=0) readonly buffer Query { vec4 query[]; };   // [dimension, token, head, sequence]
+layout(binding=1) readonly buffer Key { vec4 key[]; };       // [dimension, token, head, sequence]
+layout(binding=2) readonly buffer Value { float value[]; };  // [token, dimension, head, sequence]
+layout(binding=3) readonly buffer Lengths { int lengths[]; };
+layout(binding=4) writeonly buffer Output { vec4 y[]; };     // [dimension, token, head, sequence]
+layout(push_constant) uniform Params { uint keys,unused0,unused1,unused2; } p;
+#include "rocm_math.glsl"
+
+const int WINDOW=64;
+const uint QUERIES=32u;
+const uint BAND=QUERIES+2u*uint(WINDOW);  // keys any query of the block attends
+const uint ROW=17u;                       // vec4 per staged key: 64 values, padded against bank conflicts
+const uint SPAN=2u*uint(WINDOW)+1u;       // probabilities per query
+
+shared vec4 band[BAND*ROW];                    // keys, then values
+shared vec4 staged[(QUERIES*SPAN+3u)/4u];      // queries, then probabilities
+shared float partial[QUERIES*33u];             // per-slot maxima, then sums
+shared float reduced[QUERIES];                 // row maxima, then sums
+
+void accumulate(int first,int last,int base,int query,uint row,uint column,inout vec4 low,inout vec4 high) {
+    for (int k=first;k<=last;++k) {
+        const uint i=row*SPAN+uint(k-query+WINDOW),j=uint(k-base)*ROW+column;
+        const float weight=staged[i/4u][i%4u];
+        low=fma(band[j],vec4(weight),low);
+        high=fma(band[j+1u],vec4(weight),high);
+    }
+}
+
+void main() {
+    const uint tid=gl_LocalInvocationID.x,keys=p.keys,first=gl_WorkGroupID.x*QUERIES;
+    const uint head=gl_WorkGroupID.z*gl_NumWorkGroups.y+gl_WorkGroupID.y;  // head of a sequence
+    const int base=int(first)-WINDOW;  // key of staged row 0
+    const int valid=min(lengths[gl_WorkGroupID.z],int(keys));
+    for (uint i=tid;i<BAND*16u;i+=256u) {
+        const int k=base+int(i/16u);
+        band[i/16u*ROW+i%16u]=k>=0 && k<int(keys) ? key[(head*keys+uint(k))*16u+i%16u] : vec4(0.0);
+    }
+    for (uint i=tid;i<QUERIES*16u;i+=256u) {
+        const uint q=first+i/16u;
+        staged[i]=q<keys ? query[(head*keys+q)*16u+i%16u] : vec4(0.0);
+    }
+    barrier();
+
+    // Invocation (group, slot) scores queries group+8a against keys whose
+    // softmax slot (key mod 32) is its own: rows slot+32b.
+    const uint group=tid/32u,slot=tid%32u;
+    float score[4][5];
+    int lo[4],hi[4];
+    [[unroll]] for (uint a=0u;a<4u;++a) {
+        const int q=int(first+group+8u*a);
+        lo[a]=max(q-WINDOW,0);
+        hi[a]=min(min(q+WINDOW,valid-1),int(keys)-1);
+        [[unroll]] for (uint b=0u;b<5u;++b) score[a][b]=0.0;
+    }
+    [[unroll]] for (uint c=0u;c<16u;++c) {
+        vec4 k4[5];
+        [[unroll]] for (uint b=0u;b<5u;++b) k4[b]=band[(slot+32u*b)*ROW+c];
+        [[unroll]] for (uint a=0u;a<4u;++a) {
+            const vec4 q4=staged[(group+8u*a)*16u+c];
+            [[unroll]] for (uint b=0u;b<5u;++b)
+                score[a][b]=fma(k4[b].w,q4.w,fma(k4[b].z,q4.z,fma(k4[b].y,q4.y,fma(k4[b].x,q4.x,score[a][b]))));
+        }
+    }
+    [[unroll]] for (uint a=0u;a<4u;++a) {
+        float peak=uintBitsToFloat(0xff800000u);
+        [[unroll]] for (uint b=0u;b<5u;++b) {
+            const int k=base+int(slot+32u*b);
+            if (k>=lo[a] && k<=hi[a]) peak=max(peak,score[a][b]);
+        }
+        partial[(group+8u*a)*33u+slot]=peak;
+    }
+    barrier();
+
+    // The keys are read; stage the values in their place, key-major.
+    for (uint i=tid;i<BAND*16u;i+=256u) {
+        const uint row=i%BAND,c=i/BAND;
+        const int k=base+int(row);
+        vec4 v=vec4(0.0);
+        if (k>=0 && k<int(keys)) {
+            const uint at=(head*64u+4u*c)*keys+uint(k);
+            v=vec4(value[at],value[at+keys],value[at+2u*keys],value[at+3u*keys]);
+        }
+        band[row*ROW+c]=v;
+    }
+    if (tid<QUERIES) {
+        float peak=partial[tid*33u];
+        for (uint s=1u;s<32u;++s) peak=max(peak,partial[tid*33u+s]);
+        reduced[tid]=peak;
+    }
+    barrier();
+
+    [[unroll]] for (uint a=0u;a<4u;++a) {
+        const float peak=reduced[group+8u*a];
+        float sum=0.0;
+        [[unroll]] for (uint b=0u;b<5u;++b) {
+            const int k=base+int(slot+32u*b);
+            if (k>=lo[a] && k<=hi[a]) {
+                score[a][b]=rocmExp(score[a][b]-peak);
+                sum+=score[a][b];
+            }
+        }
+        partial[(group+8u*a)*33u+slot]=sum;
+    }
+    barrier();
+    if (tid<QUERIES) {
+        float sums[32];
+        [[unroll]] for (uint s=0u;s<32u;++s) sums[s]=partial[tid*33u+s];
+        [[unroll]] for (uint width=16u;width>0u;width>>=1u)
+            [[unroll]] for (uint s=0u;s<width;++s) sums[s]+=sums[s+width];
+        reduced[tid]=sums[0];
+    }
+    barrier();
+    [[unroll]] for (uint a=0u;a<4u;++a) {
+        const uint row=group+8u*a;
+        const float sum=reduced[row];
+        [[unroll]] for (uint b=0u;b<5u;++b) {
+            const int k=base+int(slot+32u*b);
+            if (k>=lo[a] && k<=hi[a]) {
+                const uint i=row*SPAN+uint(k-int(first+row)+WINDOW);
+                staged[i/4u][i%4u]=rocmDivide(score[a][b],sum);
+            }
+        }
+    }
+    barrier();
+
+    // Invocation (dimensions, row) weighs the values of 8 dimensions for query row.
+    const uint row=tid%32u,dimensions=tid/32u,q=first+row;
+    if (q>=keys) return;
+    const int qi=int(q),first_key=max(qi-WINDOW,0),last_key=min(min(qi+WINDOW,valid-1),int(keys)-1);
+    vec4 low=vec4(0.0),high=vec4(0.0);
+    if (first_key>last_key) {
+        const uint at=(head*64u+8u*dimensions)*keys;
+        low=fma(vec4(value[at],value[at+keys],value[at+2u*keys],value[at+3u*keys]),vec4(1.0),low);
+        high=fma(vec4(value[at+4u*keys],value[at+5u*keys],value[at+6u*keys],value[at+7u*keys]),vec4(1.0),high);
+    } else {
+        const int full=int(keys/8u*8u);
+        if (dimensions>=4u && full>=128) {
+            accumulate(max(first_key,64),min(last_key,full-1),base,qi,row,2u*dimensions,low,high);
+            accumulate(first_key,min(last_key,63),base,qi,row,2u*dimensions,low,high);
+            accumulate(max(first_key,full),last_key,base,qi,row,2u*dimensions,low,high);
+        } else {
+            accumulate(first_key,last_key,base,qi,row,2u*dimensions,low,high);
+        }
+    }
+    const uint at=(head*keys+q)*16u+2u*dimensions;
+    y[at]=low;
+    y[at+1u]=high;
+}

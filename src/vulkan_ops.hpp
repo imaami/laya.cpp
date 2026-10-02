@@ -9,11 +9,12 @@ namespace laya::vulkan_precision {
 // Custom nodes run only by the patched Vulkan backend (vulkan_dispatch.hpp):
 // op_params[0] carries the operator flags and op_params[1] the operator, which
 // the name confirms once, when the backend admits the node.
-enum class op { pad16, finish, split, merge, pack_qkv, serial, reduce, mlp_bf16, mlp_f16, gelu_bf16, gelu_f16, norm, mask, heads, none };
+enum class op { pad16, finish, split, merge, pack_qkv, serial, reduce, mlp_bf16, mlp_f16, gelu_bf16, gelu_f16, norm, mask, heads,
+                local_attention, none };
 inline constexpr const char* op_names[]={"laya.pad16-vulkan","laya.finish-projection-vulkan","laya.split-vulkan",
     "laya.merge-vulkan","laya.pack-qkv-vulkan","laya.serial-vulkan","laya.reduce-vulkan","laya.mlp-bf16-vulkan",
     "laya.mlp-f16-vulkan","laya.gelu-bf16-vulkan","laya.gelu-f16-vulkan","laya.norm-vulkan","laya.mask-vulkan",
-    "laya.merge-heads-vulkan"};
+    "laya.merge-heads-vulkan","laya.local-attention-vulkan"};
 static_assert(std::size(op_names)==std::size_t(op::none));
 inline op kind(const ggml_tensor* t) {
     const auto k=uint32_t(t->op_params[1]);
@@ -22,7 +23,8 @@ inline op kind(const ggml_tensor* t) {
 [[noreturn]] inline void no_cpu(ggml_tensor*, int, int, void*) { GGML_ABORT("Laya Vulkan operators require a Vulkan GPU"); }
 inline ggml_tensor* custom(ggml_context* ctx, op kind, ggml_type type, std::array<int64_t,4> ne,
                            std::initializer_list<ggml_tensor*> inputs, int32_t flags=0) {
-    ggml_tensor* args[3];
+    ggml_tensor* args[4];
+    if (inputs.size()>std::size(args)) GGML_ABORT("Too many Vulkan operator inputs");
     int count=0;
     for (auto input:inputs) if (input) args[count++]=input;
     auto output=ggml_custom_4d(ctx,type,ne[0],ne[1],ne[2],ne[3],args,count,no_cpu,1,nullptr);
@@ -99,6 +101,21 @@ inline ggml_tensor* activation(ggml_context* ctx, ggml_tensor* x, ggml_tensor* t
 inline ggml_tensor* norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias,
                          ggml_type stored_type=GGML_TYPE_F32) {
     return custom(ctx,op::norm,GGML_TYPE_F32,{x->ne[0],x->ne[1],x->ne[2],x->ne[3]},{x,weight,bias},storage(stored_type));
+}
+// Sliding-window attention as one pass per 32 queries of a head of a
+// sequence: Q and K scaled and V transposed by the pack, keys valid by the
+// lengths, every value rounded as the separate AMD-matched score, softmax and
+// value products round it with the local mask (local_attention.comp). Lanes
+// stay within the matched softmax's 1024 keys; the pass stages 160 keys and
+// values of 64 dimensions, the probabilities of 32 queries and the per-slot
+// softmax partials in workgroup memory.
+inline constexpr int64_t local_attention_keys=1024;
+inline constexpr uint32_t local_attention_shared=160*17*16+(32*129+3)/4*16+32*33*4+32*4;
+inline ggml_tensor* local_attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* lengths) {
+    if (q->ne[0]!=64 || !ggml_are_same_shape(q,k) || v->ne[0]!=q->ne[1] || v->ne[1]!=64 || v->ne[2]!=q->ne[2] ||
+        v->ne[3]!=q->ne[3] || lengths->type!=GGML_TYPE_I32 || ggml_nelements(lengths)!=q->ne[3] || q->ne[1]>local_attention_keys)
+        GGML_ABORT("Invalid Vulkan local attention geometry");
+    return custom(ctx,op::local_attention,GGML_TYPE_F32,{64,q->ne[1],q->ne[2],q->ne[3]},{q,k,v,lengths});
 }
 // 0 where a query may attend a key and -inf elsewhere, from the valid length of
 // each sequence. Local masks open keys within 64 positions, and the first key for

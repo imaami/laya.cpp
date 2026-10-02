@@ -276,11 +276,13 @@ std::vector<entry> entries(weights& w, const architecture& arch, int actions) {
 template<bool Stored> struct operand { tensor* t; };
 using wide = operand<false>;
 
-// Where an attention block sits, for kernels selected by shape.
+// Where an attention block sits, for kernels selected by shape, and the
+// valid length of each of its sequences.
 struct attention_site {
     bool head, global, padding;
     int length, batch;
     std::int64_t width;
+    tensor* lengths;
     std::int64_t tokens() const { return std::int64_t(length) * batch; }
     // Fused mixed-precision attention names the masks its kernels must apply.
     const char* masked_kernel() const {
@@ -484,7 +486,10 @@ struct numerics<M> {
             return wide{fused_attention(ctx, q, k, v, mask, mask ? at.masked_kernel() : "laya.sdpa-flash", at)};
         } else {
             // Heads merge into token rows stored as the output projection reads them.
-            return operand<true>{vulkan_precision::merge_heads(ctx, attention_products<amd, packing>(ctx, q, k, v, mask), low)};
+            // AMD-matched sliding windows run as one pass with the same roundings.
+            auto* value = amd && !at.head && !at.global ? vulkan_precision::local_attention(ctx, q, k, v, at.lengths)
+                                                        : attention_products<amd, packing>(ctx, q, k, v, mask);
+            return operand<true>{vulkan_precision::merge_heads(ctx, value, low)};
         }
     }
     // Rotary and GELU tables reproduce the rounded values of the matched device library.
@@ -657,7 +662,7 @@ template<mode M> struct network {
         trace(h, "embedding");
         for (int layer = 0; layer < arch.layers; ++layer) {
             const auto& p = e.layers[layer];
-            const attention_site at{false, global_layer(layer), padding, length, batch, arch.width};
+            const attention_site at{false, global_layer(layer), padding, length, batch, arch.width, g.lengths};
             const projections attn{p.attn.Wqkv.weight, nullptr, p.attn.Wo.weight, nullptr};
             auto* attended = layer == 0 ? attention<false>(wide{h}, attn, at, "encoder.layers.", layer, h, g)
                                         : attention<false>(N::template norm<true>(ctx, h, p.attn_norm), attn, at, "encoder.layers.", layer, h, g);
@@ -683,7 +688,7 @@ template<mode M> struct network {
         h = ggml_add(ctx, h, ggml_get_rows(ctx, w.type_emb.weight, g.types));
         for (int layer = 0; layer < 2; ++layer) {
             const auto& p = w.head.layers[layer];
-            const attention_site at{true, global_layer(layer), padding, length, batch, arch.width};
+            const attention_site at{true, global_layer(layer), padding, length, batch, arch.width, g.lengths};
             const projections attn{p.self_attn.in_proj_weight, p.self_attn.in_proj_bias, p.self_attn.out_proj.weight, p.self_attn.out_proj.bias};
             auto* attended = attention<true>(N::template norm<true>(ctx, h, p.norm1), attn, at, "head.layers.", layer, h, g);
             h = fused ? attended : ggml_add(ctx, h, attended);
