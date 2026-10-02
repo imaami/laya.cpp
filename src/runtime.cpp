@@ -422,6 +422,8 @@ struct numerics<M> {
 
 // Mixed FP16/BF16 on Vulkan: portable kernels keep the storage rounding points
 // of autocast. Vendor bits select the device whose reference numerics are matched.
+// Compact products stay unrounded: their consumers (pack, activation) round on
+// read, and activations store values the next projection reads as they are.
 template<mode M> requires(has(M, feature::vulkan) && (M & feature::low) != 0)
 struct numerics<M> {
     static constexpr ggml_type low = has(M, feature::fp16) ? GGML_TYPE_F16 : GGML_TYPE_BF16;
@@ -448,17 +450,19 @@ struct numerics<M> {
             // products before the final rounding.
             if (bf16 && weight->ne[1] == 1 && x->ne[1] > 1 && !plan.chunk) plan.chunk = 64;
         }
-        return {vulkan_precision::linear(ctx, x, weight, bias, residual, low, plan, amd)};
+        return {vulkan_precision::linear(ctx, x, weight, bias, residual, low, plan, amd, Compact)};
     }
-    static wide gelu(ggml_context* ctx, tensor* table, wide x) { return {vulkan_precision::activation(ctx, x.t, table, false, bf16)}; }
-    template<bool Stored> static wide gated_gelu(ggml_context* ctx, tensor* table, operand<Stored> gated) {
+    // A compact product as stored, for tracing.
+    static tensor* stored(ggml_context* ctx, tensor* x) { return vulkan_precision::finish_projection(ctx, x, nullptr, nullptr, low); }
+    static operand<true> gelu(ggml_context* ctx, tensor* table, wide x) { return {vulkan_precision::activation(ctx, x.t, table, false, bf16)}; }
+    template<bool Stored> static operand<true> gated_gelu(ggml_context* ctx, tensor* table, operand<Stored> gated) {
         return {vulkan_precision::activation(ctx, gated.t, table, true, bf16)};
     }
     static tensor* round(ggml_context* ctx, tensor* x) { return vulkan_precision::round(ctx, x, low); }
     static tensor* pack(ggml_context* ctx, tensor* qkv, tensor* cosine, tensor* sine, int length, int batch) {
         return vulkan_precision::pack_qkv(ctx, qkv, cosine, sine, length, batch, low);
     }
-    static tensor* query(ggml_context* ctx, tensor* q) { return ggml_cast(ctx, q, GGML_TYPE_F32); }
+    static tensor* query(ggml_context*, tensor* q) { return q; }  // packed in FP32
     static tensor* attend(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
         if constexpr (has(M, feature::flash) && !amd) {
             // Unpadded global (or fully windowed) attention needs no mask.
@@ -519,22 +523,27 @@ result<void> allocate(ggml_cgraph* graph, ggml_backend_t backend, ggml_gallocr* 
     if (!ggml_gallocr_reserve(memory, graph) || !ggml_gallocr_alloc_graph(memory, graph)) return fail(errc::backend, "Insufficient memory for this batch");
     return {};
 }
-// Keeps a graph value for LAYA_TRACE_DIR, named scope + layer + suffix.
-void trace(trace_list* traces, tensor* value, std::string_view scope, int layer = -1, std::string_view suffix = {}) {
-    if (!traces) return;
-    ggml_set_output(value);
-    traces->emplace_back(std::string(scope).append(layer < 0 ? "" : std::to_string(layer)).append(suffix), value);
-}
-
 // The Laya topology: ModernBERT encoder, two decision-head layers, option
 // scorer and action head. numerics<M> supplies the arithmetic.
 template<mode M> struct network {
     using N = numerics<M>;
     static constexpr bool fused = N::fused_residual;  // projections add their residual
     ggml_context* ctx;
+    ggml_cgraph* graph;
     const weights& w;
     const architecture& arch;
     trace_list* traces;  // null unless tracing
+
+    // Keeps a graph value for LAYA_TRACE_DIR, named scope + layer + suffix. A
+    // compact product that numerics leave unrounded is kept as stored, by a
+    // rounding node beside the graph.
+    template<bool Compact = false>
+    void trace(tensor* value, std::string_view scope, int layer = -1, std::string_view suffix = {}) {
+        if (!traces) return;
+        if constexpr (Compact && requires { N::stored(ctx, value); }) ggml_build_forward_expand(graph, value = N::stored(ctx, value));
+        ggml_set_output(value);
+        traces->emplace_back(std::string(scope).append(layer < 0 ? "" : std::to_string(layer)).append(suffix), value);
+    }
 
     // Resident tables: rotary rows of every servable position and any GELU lookup values.
     static void tables(const weights& w, const architecture& arch, int positions) {
@@ -565,20 +574,21 @@ template<mode M> struct network {
     template<bool Head, bool Stored>
     tensor* attention(operand<Stored> x, const projections& p, const attention_site& at, const char* scope, int layer, tensor* h,
                       const encoder_graph& g) {
-        trace(traces, x.t, scope, layer, ".qkv-input");
+        trace(x.t, scope, layer, ".qkv-input");
         // Batched head inputs have a transposed sequence/batch layout in the
         // mixed-precision contract: the product is rounded before this bias.
         const bool separate_bias = N::mixed && Head && at.batch > 1;
+        constexpr bool compact = N::mixed && !Head;  // packed from storage precision
         tensor* qkv;
         if (N::transposed_head && Head && at.batch > 1) {
             auto* bx = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, x.t, at.width, at.length, at.batch), 0, 2, 1, 3));
             auto* by = N::template linear<role::trunk>(ctx, wide{bx}, p.qkv, nullptr).t;
             qkv = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, by, 0, 2, 1, 3)), 3 * at.width, at.tokens());
         } else {
-            qkv = N::template linear<role::trunk, N::mixed && !Head>(ctx, x, p.qkv, Head && !separate_bias ? p.qkv_bias : nullptr).t;
+            qkv = N::template linear<role::trunk, compact>(ctx, x, p.qkv, Head && !separate_bias ? p.qkv_bias : nullptr).t;
         }
         if (separate_bias) qkv = N::round(ctx, ggml_add(ctx, qkv, p.qkv_bias));
-        trace(traces, qkv, scope, layer, ".attn.Wqkv");
+        trace<compact>(qkv, scope, layer, ".attn.Wqkv");
         const int kind = at.global ? 0 : 1;
         auto* packed = N::pack(ctx, qkv, Head ? nullptr : g.cosine[kind], Head ? nullptr : g.sine[kind], at.length, at.batch);
         tensor* split[3];
@@ -587,13 +597,13 @@ template<mode M> struct network {
                                     i * at.batch * packed->nb[3]);
         auto *q = N::query(ctx, split[0]), *k = split[1];
         if (traces) {  // traced views are made contiguous
-            trace(traces, q = ggml_cont(ctx, q), scope, layer, ".q");
-            trace(traces, k = ggml_cont(ctx, k), scope, layer, ".k");
+            trace(q = ggml_cont(ctx, q), scope, layer, ".q");
+            trace(k = ggml_cont(ctx, k), scope, layer, ".k");
         }
         auto* value = N::attend(ctx, q, k, split[2], Head || at.global ? g.global_mask : g.local_mask, at);
-        trace(traces, value, scope, layer, ".attn.Wo.input");
+        trace(value, scope, layer, ".attn.Wo.input");
         auto* output = N::template linear<role::trunk>(ctx, wide{value}, p.out, Head ? p.out_bias : nullptr, fused ? h : nullptr).t;
-        trace(traces, output, scope, layer, fused ? ".attn.residual" : ".attn.Wo");
+        trace(output, scope, layer, fused ? ".attn.residual" : ".attn.Wo");
         return output;
     }
 
@@ -620,7 +630,7 @@ template<mode M> struct network {
 
         const auto& e = w.encoder;
         auto* h = N::template norm<false>(ctx, ggml_get_rows(ctx, e.embeddings.tok_embeddings.weight, g.ids), e.embeddings.norm).t;
-        trace(traces, h, "embedding");
+        trace(h, "embedding");
         for (int layer = 0; layer < arch.layers; ++layer) {
             const auto& p = e.layers[layer];
             const attention_site at{false, global_layer(layer), padding, length, batch, arch.width};
@@ -633,19 +643,19 @@ template<mode M> struct network {
                 h = ggml_add(ctx, h, merge_f16(ctx, ggml_mul_mat(ctx, p.mlp.Wo.weight, mlp_split_f16(ctx, products))));
             } else {
                 auto normalized = N::template norm<true>(ctx, h, p.mlp_norm);
-                trace(traces, normalized.t, "encoder.layers.", layer, ".mlp.Wi.input");
+                trace(normalized.t, "encoder.layers.", layer, ".mlp.Wi.input");
                 auto gated = N::template linear<role::trunk, true>(ctx, normalized, p.mlp.Wi.weight, nullptr);
-                trace(traces, gated.t, "encoder.layers.", layer, ".mlp.Wi");
+                trace<true>(gated.t, "encoder.layers.", layer, ".mlp.Wi");
                 auto activated = N::gated_gelu(ctx, w.gelu_table, gated);
-                trace(traces, activated.t, "encoder.layers.", layer, ".mlp.Wo.input");
+                trace(activated.t, "encoder.layers.", layer, ".mlp.Wo.input");
                 auto* projected = N::template linear<role::trunk>(ctx, activated, p.mlp.Wo.weight, nullptr, fused ? h : nullptr).t;
-                trace(traces, projected, "encoder.layers.", layer, fused ? ".mlp.residual" : ".mlp.Wo");
+                trace(projected, "encoder.layers.", layer, fused ? ".mlp.residual" : ".mlp.Wo");
                 h = fused ? projected : ggml_add(ctx, h, projected);
             }
-            trace(traces, h, "encoder-", layer);
+            trace(h, "encoder-", layer);
         }
         h = N::template norm<false>(ctx, h, e.final_norm).t;
-        trace(traces, h, "final-norm");
+        trace(h, "final-norm");
         h = ggml_add(ctx, h, ggml_get_rows(ctx, w.type_emb.weight, g.types));
         for (int layer = 0; layer < 2; ++layer) {
             const auto& p = w.head.layers[layer];
@@ -654,11 +664,11 @@ template<mode M> struct network {
             auto* attended = attention<true>(N::template norm<true>(ctx, h, p.norm1), attn, at, "head.layers.", layer, h, g);
             h = fused ? attended : ggml_add(ctx, h, attended);
             auto* first = N::template linear<role::trunk>(ctx, N::template norm<true>(ctx, h, p.norm2), p.linear1.weight, p.linear1.bias).t;
-            trace(traces, first, "head.layers.", layer, ".linear1");
+            trace(first, "head.layers.", layer, ".linear1");
             auto* second = N::template linear<role::trunk>(ctx, wide{ggml_relu(ctx, first)}, p.linear2.weight, p.linear2.bias, fused ? h : nullptr).t;
-            trace(traces, second, "head.layers.", layer, fused ? ".linear2-residual" : ".linear2");
+            trace(second, "head.layers.", layer, fused ? ".linear2-residual" : ".linear2");
             h = fused ? second : ggml_add(ctx, h, second);
-            trace(traces, h, "head-", layer);
+            trace(h, "head-", layer);
         }
         g.pooled = ggml_get_rows(ctx, h, g.cls);
         auto selected = N::template norm<true>(ctx, ggml_get_rows(ctx, h, g.markers), w.scorer[0]);
@@ -742,7 +752,7 @@ struct runtime::impl {
         }
 #endif
 #if LAYA_VULKAN
-        if (has(m, vulkan)) backend.reset(ggml_backend_vk_init(0));
+        if (has(m, vulkan) && ggml_backend_vk_get_device_count() > 0) backend.reset(ggml_backend_vk_init(0));
 #endif
         if (has(m, cpu)) backend.reset(ggml_backend_cpu_init());
         if (!backend) return fail(errc::backend, "Cannot initialize requested backend");
@@ -973,7 +983,7 @@ struct runtime::impl {
         g.context.reset(ggml_init({ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false), nullptr, true}));
         if (!g.context) return fail(errc::backend, "Cannot allocate graph metadata");
         g.graph = ggml_new_graph_custom(g.context.get(), 8192, false);
-        network<M>{g.context.get(), w, model.arch, trace_directory.empty() ? nullptr : &g.traces}.build(g);
+        network<M>{g.context.get(), g.graph, w, model.arch, trace_directory.empty() ? nullptr : &g.traces}.build(g);
         LAYA_CHECK(allocate(g.graph, backend.get(), memory));
         slot.emplace(std::move(g));
         return {};

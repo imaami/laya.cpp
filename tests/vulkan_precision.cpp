@@ -8,9 +8,10 @@
 #include "vulkan/gelu_tables.hpp"
 #include "vulkan/gelu_rocm_patches.hpp"
 #include "vulkan_rotary.hpp"
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
-#include <array>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -106,11 +107,12 @@ int main() {
             return type==GGML_TYPE_F16 ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(value)) :
                    type==GGML_TYPE_BF16 ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(value)) : value;
         };
-        std::vector<float> input(count),cosine(64*length),sine(64*length),expected(count),actual(count);
-        for (int i=0;i<count;++i) input[i]=rounded(std::sin(float(i)*0.137f)*13.17f);
-        input[0]=rounded(std::ldexp(1.f,-24));
-        input[32]=rounded(-std::ldexp(1.f,-23));
-        input[64]=rounded(32752.f);input[96]=rounded(-32752.f);
+        std::vector<float> products(count),input(count),cosine(64*length),sine(64*length),expected(count),actual(count);
+        for (int i=0;i<count;++i) products[i]=std::sin(float(i)*0.137f)*13.17f;
+        products[0]=std::ldexp(1.f,-24);
+        products[32]=-std::ldexp(1.f,-23);
+        products[64]=32752.f;products[96]=-32752.f;
+        std::ranges::transform(products,input.begin(),rounded);
         for (int t=0;t<length;++t) for (int d=0;d<64;++d) {
             const float angle=float((t+1)*(d%32+1))*0.0317f;
             cosine[t*64+d]=std::cos(angle);sine[t*64+d]=std::sin(angle);
@@ -138,6 +140,11 @@ int main() {
         if (ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) laya::test::fail("QKV packing compute failed");
         ggml_backend_tensor_get(output,actual.data(),0,ggml_nbytes(output));
         if (actual!=expected) laya::test::fail("QKV packing changed layout or rotary rounding");
+        // Unrounded products are rounded to storage precision on read.
+        ggml_backend_tensor_set(x,products.data(),0,ggml_nbytes(x));
+        if (ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) laya::test::fail("QKV packing compute failed");
+        ggml_backend_tensor_get(output,actual.data(),0,ggml_nbytes(output));
+        if (actual!=expected) laya::test::fail("QKV packing did not round products on read");
         ggml_gallocr_free(allocator);ggml_free(ctx);
     }
     for (bool rocm : {false,true}) {
@@ -479,32 +486,42 @@ int main() {
         if (!ggml_gallocr_alloc_graph(allocator,graph)) laya::test::fail("activation allocation failed");
         auto decode=[&](uint16_t bits) { return bf16 ? ggml_bf16_to_fp32(ggml_bf16_t{bits}) : ggml_fp16_to_fp32(bits); };
         auto round=[&](float value) { return bf16 ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(value)) : ggml_fp16_to_fp32(ggml_fp32_to_fp16(value)); };
+        // An unrounded product just beyond the midpoint toward zero rounds to
+        // its 16-bit value on read, where truncation would not.
+        auto product=[&](uint16_t value) {
+            const float wide=decode(value);
+            if (!(value&0x7fff) || !std::isfinite(wide)) return wide;
+            return std::nextafter(float((double(wide)+double(decode(uint16_t(value-1))))/2),wide);
+        };
         const auto* base_bits=bf16 ? laya::vulkan_precision::gelu_bf16_nvidia : laya::vulkan_precision::gelu_fp16_nvidia;
         std::vector<uint16_t> bits(base_bits,base_bits+65536);
         if (rocm) {
             if (bf16) for (auto patch:laya::vulkan_precision::gelu_bf16_rocm) bits[patch.index]=patch.value;
             else for (auto patch:laya::vulkan_precision::gelu_fp16_rocm) bits[patch.index]=patch.value;
         }
-        std::vector<float> inputs(65536*(gated ? 2 : 1)),lookup(65536),expected(65536),actual(65536);
+        std::vector<float> inputs(65536*(gated ? 2 : 1)),products(inputs.size()),lookup(65536),expected(65536),actual(65536);
         for (int i=0;i<65536;++i) {
             int source=(i/width)*width*(gated ? 2 : 1)+i%width;
-            inputs[source]=decode(uint16_t(i)); lookup[i]=decode(bits[i]);
+            inputs[source]=decode(uint16_t(i)); products[source]=product(uint16_t(i)); lookup[i]=decode(bits[i]);
             expected[i]=lookup[i];
             if (gated) {
                 float gate=round((i%17-8)/16.f);
                 inputs[source+width]=gate; expected[i]=round(expected[i]*gate);
+                products[source+width]=product(bf16 ? ggml_fp32_to_bf16(gate).bits : ggml_fp32_to_fp16(gate));
             }
         }
-        ggml_backend_tensor_set(x,inputs.data(),0,ggml_nbytes(x));
         ggml_backend_tensor_set(table,lookup.data(),0,ggml_nbytes(table));
-        if (ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) laya::test::fail("activation compute failed");
-        ggml_backend_tensor_get(output,actual.data(),0,ggml_nbytes(output));
-        for (int i=0;i<65536;++i)
-            if (!(std::isnan(expected[i]) ? std::isnan(actual[i]) :
-                  std::memcmp(&expected[i],&actual[i],sizeof(float))==0)) {
-                std::cerr << "activation bf16=" << bf16 << " gated=" << gated << " input=" << inputs[(i/width)*width*(gated ? 2 : 1)+i%width] << " expected=" << expected[i] << " actual=" << actual[i] << '\n';
-                laya::test::fail("16-bit activation changed the numerical table");
-            }
+        for (const auto* values : {&inputs,&products}) {
+            ggml_backend_tensor_set(x,values->data(),0,ggml_nbytes(x));
+            if (ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) laya::test::fail("activation compute failed");
+            ggml_backend_tensor_get(output,actual.data(),0,ggml_nbytes(output));
+            for (int i=0;i<65536;++i)
+                if (!(std::isnan(expected[i]) ? std::isnan(actual[i]) :
+                      std::memcmp(&expected[i],&actual[i],sizeof(float))==0)) {
+                    std::cerr << "activation bf16=" << bf16 << " gated=" << gated << " input=" << (*values)[(i/width)*width*(gated ? 2 : 1)+i%width] << " expected=" << expected[i] << " actual=" << actual[i] << '\n';
+                    laya::test::fail("16-bit activation changed the numerical table");
+                }
+        }
         ggml_gallocr_free(allocator); ggml_free(ctx);
     }
     for (int width : {768,1024,1028}) for (bool affine_bias : {false,true}) {

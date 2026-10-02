@@ -23,10 +23,11 @@ void main() {
     uint batch=(index/(64*p.tokens*p.heads))%p.batches;
     uint width=64*p.heads;
     uint source=(batch*p.tokens+token)*3*width+component*width+head*64+d;
-    float value=x[source];
+    // Projections pass unrounded products; storage rounding happens on read.
+    float value=roundOutput(x[source]);
     if ((p.flags&4)!=0 && component<2) {
         uint opposite=d<32 ? source+32 : source-32;
-        float rotated=d<32 ? -x[opposite] : x[opposite];
+        float rotated=d<32 ? -roundOutput(x[opposite]) : roundOutput(x[opposite]);
         precise float first=value*cosine[token*64+d];
         precise float second=rotated*sine[token*64+d];
         precise float sum=first+second;

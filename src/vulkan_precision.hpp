@@ -10,8 +10,10 @@ namespace laya::vulkan_precision {
 inline ggml_tensor* round(ggml_context* ctx, ggml_tensor* x, ggml_type type) {
     return ggml_cast(ctx, ggml_cast(ctx,x,type),GGML_TYPE_F32);
 }
+// A raw product, without bias or residual, is left for a consumer that rounds
+// it to storage precision on read.
 inline ggml_tensor* linear(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias, ggml_tensor* residual,
-                          ggml_type type, projection_plan plan={}, bool amd_matching=false) {
+                          ggml_type type, projection_plan plan={}, bool amd_matching=false, bool raw=false) {
     if (x->type!=GGML_TYPE_F32) x=ggml_cast(ctx,x,GGML_TYPE_F32);
     ggml_tensor* product;
     if (const int split_k=plan.chunk) {
@@ -35,6 +37,6 @@ inline ggml_tensor* linear(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weigh
         ggml_prec_set_acc(product,GGML_PREC_F32);
         if (amd_matching) ggml_set_name(product,"laya.amd-low-projection");
     }
-    return finish_projection(ctx,product,bias,residual,type);
+    return raw && !bias && !residual ? product : finish_projection(ctx,product,bias,residual,type);
 }
 }
