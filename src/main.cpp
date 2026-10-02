@@ -10,8 +10,9 @@ namespace {
 using namespace laya;
 
 constexpr std::string_view usage =
-    "laya-cli [--model DIR] [--variant english|multilingual|typed-decisions] [--input JSON] [--raw|--prepare] [--allow-truncation] [--fp32|--fp16|--bf16] [--cpu|--cuda|--vulkan|--coreml]\n"
+    "laya-cli [--model DIR] [--variant english|multilingual|typed-decisions] [--input JSON] [--raw|--prepare] [--allow-truncation] [--pad-to-longest] [--fp32|--fp16|--bf16] [--cpu|--cuda|--vulkan|--coreml]\n"
     "Requests that exceed model token budgets are rejected by default; --allow-truncation restores legacy truncation.\n"
+    "Questions run in lanes of similar length, each padded to its longest question; --pad-to-longest pads all to the longest.\n"
     "--tensor-core-fp32 --flash-fp32 enables the optimized CUDA path.\n"
     "--bf16 enables mixed BF16 on CUDA or Vulkan; --fp16 currently requires Vulkan.\n--experimental-bf16 is a compatibility alias. See docs/precision.md and docs/vulkan.md for validated hardware and toolchains.\n"
     "--coreml requires a -DLAYA_COREML=ON Apple Silicon build and compiled coreml/ buckets; precision is selected during export. See docs/coreml.md.\n"
@@ -25,7 +26,7 @@ constexpr std::string_view usage =
 result<void> run(int argc, char** argv) {
     std::string model = "models/laya", input_file, variant = "english";
     mode backend = feature::cuda, precision = 0, flash = 0, compensated = 0;
-    bool raw = false, prepare = false, allow_truncation = false, server = false, http_option = false;
+    bool raw = false, prepare = false, allow_truncation = false, pad_to_longest = false, server = false, http_option = false;
     http_options http;
     // Assigns a bounded numeric HTTP option.
     auto number = [&](auto& target, std::string_view value, int maximum, int minimum = 1) -> result<void> {
@@ -64,6 +65,7 @@ result<void> run(int argc, char** argv) {
         else if (arg == "--raw") raw = true;
         else if (arg == "--prepare") prepare = true;
         else if (arg == "--allow-truncation") allow_truncation = true;
+        else if (arg == "--pad-to-longest") pad_to_longest = true;
         else if (arg == "--help") return std::cout << usage, result<void>{};
         else return fail(errc::invalid, "Unknown or incomplete option: " + std::string(arg));
     }
@@ -73,7 +75,8 @@ result<void> run(int argc, char** argv) {
         return fail(errc::invalid, "--server cannot be combined with --input, --raw or --prepare");
     if (http_option && !server) return fail(errc::invalid, "HTTP options require --server");
     if (variant != "english") model = (std::filesystem::path(model) / variant).string();
-    LAYA_TRY(laya, agent::load(model, backend | precision | flash | compensated, allow_truncation ? overflow::truncate : overflow::reject));
+    LAYA_TRY(laya, agent::load(model, backend | precision | flash | compensated, allow_truncation ? overflow::truncate : overflow::reject,
+                               pad_to_longest ? padding::longest : padding::grouped));
     std::cerr << "Ready: " << laya->backend_name() << " (" << laya->device_name() << ")\n";
     const auto predict = [&](const json& requests) { return laya->predict(requests); };
     if (server) {

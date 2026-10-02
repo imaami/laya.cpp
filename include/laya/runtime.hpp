@@ -82,7 +82,12 @@ struct raw_result {
     std::vector<float> logits, actions;
     int action_count = 0;
     double compute_ms = 0;
+    std::vector<int> lanes;  // the lane that computed each row
 };
+// How the runtime pads a batch: rows run in lanes of similar length, each
+// padded to its own longest row, or all padded to the batch's longest row as
+// the reference implementation pads them.
+enum class padding : bool { grouped, longest };
 
 using token = std::int32_t;
 using tokens = std::vector<token>;
@@ -123,7 +128,7 @@ json inputs(const batch& input);  // as --prepare prints them
 // Model execution in the mode chosen at load. Callers serialize forward().
 class runtime {
 public:
-    [[nodiscard]] static result<runtime> load(const std::filesystem::path& directory, mode requested);
+    [[nodiscard]] static result<runtime> load(const std::filesystem::path& directory, mode requested, padding rows = padding::grouped);
     [[nodiscard]] result<raw_result> forward(const batch& input);
     const checkpoint& model() const;
     const std::string& backend_name() const;
@@ -138,7 +143,8 @@ private:
 struct agent {
     runtime engine;
     codec format;
-    [[nodiscard]] static result<agent> load(const std::filesystem::path& directory, mode requested, overflow policy);
+    [[nodiscard]] static result<agent> load(const std::filesystem::path& directory, mode requested, overflow policy,
+                                            padding rows = padding::grouped);
     [[nodiscard]] result<json> predict(const json& requests);        // calibrated answers per request
     [[nodiscard]] result<json> raw(const json& requests);            // model inputs and outputs
     [[nodiscard]] result<json> prepare(const json& requests) const;  // model inputs, without running the model

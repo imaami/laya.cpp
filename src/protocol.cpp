@@ -180,8 +180,8 @@ json inputs(const batch& input) {
             {"lengths", input.lengths}, {"markers", input.markers}, {"counts", input.counts}, {"types", input.types}};
 }
 
-result<agent> agent::load(const std::filesystem::path& directory, mode requested, overflow policy) {
-    LAYA_TRY(engine, runtime::load(directory, requested));
+result<agent> agent::load(const std::filesystem::path& directory, mode requested, overflow policy, padding rows) {
+    LAYA_TRY(engine, runtime::load(directory, requested, rows));
     LAYA_TRY(format, codec::load(engine->model(), policy));
     return agent{std::move(*engine), std::move(*format)};
 }
@@ -195,7 +195,7 @@ result<json> agent::raw(const json& requests) {
     LAYA_TRY(questions, format.prepare(requests));
     LAYA_TRY(output, engine.forward(questions->input));
     return json{{"inputs", inputs(questions->input)}, {"logits", output->logits}, {"actions", output->actions},
-                {"action_count", output->action_count}, {"compute_ms", output->compute_ms}};
+                {"action_count", output->action_count}, {"lanes", output->lanes}, {"compute_ms", output->compute_ms}};
 }
 
 // Calibrated answers: per-type softmax temperature over each question's option logits.

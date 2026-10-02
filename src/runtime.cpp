@@ -1,5 +1,6 @@
 #include "laya/runtime.hpp"
 #include "laya/precision.hpp"
+#include "lanes.hpp"
 #include "vulkan_precision.hpp"
 #include "vulkan_rotary.hpp"
 #include "vulkan_status.hpp"
@@ -153,11 +154,6 @@ struct transfer {
         return host;
     }
     template<class T> void send(tensor* t, std::span<T> host) { ggml_backend_tensor_set_async(backend, t, host.data(), 0, host.size_bytes()); }
-    template<class T> void send(tensor* t, const std::vector<T>& values) {
-        const auto host = take<T>(t);
-        std::ranges::copy(values, host.begin());
-        send(t, host);
-    }
     template<class T> std::span<T> receive(const tensor* t) {
         const auto host = take<T>(t);
         ggml_backend_tensor_get_async(backend, t, host.data(), 0, host.size_bytes());
@@ -491,7 +487,7 @@ struct numerics<M> {
 };
 
 // Graph shapes are fixed per compiled graph; mixed precision also depends on
-// whether any row is shorter than the batch length.
+// whether any row is shorter than its lane.
 struct graph_shape {
     int batch = 0, length = 0, options = 0;
     bool padding = false;
@@ -505,13 +501,18 @@ template<class Key> struct compiled_graph {
     ggml_cgraph* graph = nullptr;
     trace_list traces;  // kept values, for LAYA_TRACE_DIR
 };
-struct encoder_graph : compiled_graph<graph_shape> {
+// The values of one lane of an encoder graph.
+struct encoder_lane {
     tensor *ids = nullptr, *types = nullptr, *markers = nullptr, *cls = nullptr, *lengths = nullptr;
     tensor *global_mask = nullptr, *local_mask = nullptr, *pooled = nullptr, *logits = nullptr;
     std::array<tensor*, 2> cosine{}, sine{};  // global and local rotary rows
 };
-struct action_graph : compiled_graph<int> {  // keyed by batch size
-    tensor *input = nullptr, *output = nullptr;
+struct encoder_graph : compiled_graph<std::vector<graph_shape>> {  // keyed by lane shapes
+    std::vector<encoder_lane> lanes;
+};
+struct action_lane { tensor *input = nullptr, *output = nullptr; };
+struct action_graph : compiled_graph<std::vector<int>> {  // keyed by lane sizes
+    std::vector<action_lane> lanes;
 };
 
 // Checks backend support and allocates every intermediate of a built graph:
@@ -573,7 +574,7 @@ template<mode M> struct network {
     struct projections { tensor *qkv, *qkv_bias, *out, *out_bias; };
     template<bool Head, bool Stored>
     tensor* attention(operand<Stored> x, const projections& p, const attention_site& at, const char* scope, int layer, tensor* h,
-                      const encoder_graph& g) {
+                      const encoder_lane& g) {
         trace(x.t, scope, layer, ".qkv-input");
         // Batched head inputs have a transposed sequence/batch layout in the
         // mixed-precision contract: the product is rounded before this bias.
@@ -607,9 +608,12 @@ template<mode M> struct network {
         return output;
     }
 
-    void build(encoder_graph& g) {
-        const auto [batch, length, options, padding] = g.key;
+    // One lane: the encoder and decision-head layers over its rows, then their
+    // pooled states and option logits.
+    encoder_lane lane(const graph_shape& shape) {
+        const auto [batch, length, options, padding] = shape;
         const std::int64_t tokens = std::int64_t(length) * batch;
+        encoder_lane g;
         g.ids = input(GGML_TYPE_I32, {tokens});
         g.types = input(GGML_TYPE_I32, {tokens});
         const auto positions = [&](tensor* table) { return ggml_view_2d(ctx, table, 64, length, table->nb[1], 0); };
@@ -675,27 +679,36 @@ template<mode M> struct network {
         g.logits = N::template linear<role::projection>(ctx, hidden, w.scorer[3].weight, w.scorer[3].bias).t;
         ggml_set_output(g.pooled);
         ggml_set_output(g.logits);
-        ggml_build_forward_expand(g.graph, g.pooled);
-        ggml_build_forward_expand(g.graph, g.logits);
+        ggml_build_forward_expand(graph, g.pooled);
+        ggml_build_forward_expand(graph, g.logits);
+        return g;
+    }
+    // Lanes are built in turn, so each one's intermediates are released before the next.
+    void build(encoder_graph& g) {
+        for (const graph_shape& shape : g.key) g.lanes.push_back(lane(shape));
     }
 
-    // The action head over pooled features and option statistics.
+    // The action head of each lane over pooled features and option statistics.
     void build(action_graph& g) {
-        g.input = input(GGML_TYPE_F32, {arch.width + 4, g.key});
         const auto& head = w.act_head;
-        auto hidden = N::gelu(ctx, w.gelu_table, N::template linear<role::projection>(ctx, wide{g.input}, head[0].weight, head[0].bias));
-        g.output = N::template linear<role::projection>(ctx, hidden, head[2].weight, head[2].bias).t;
-        ggml_set_output(g.output);
-        ggml_build_forward_expand(g.graph, g.output);
+        for (const int rows : g.key) {
+            action_lane& io = g.lanes.emplace_back();
+            io.input = input(GGML_TYPE_F32, {arch.width + 4, rows});
+            auto hidden = N::gelu(ctx, w.gelu_table, N::template linear<role::projection>(ctx, wide{io.input}, head[0].weight, head[0].bias));
+            io.output = N::template linear<role::projection>(ctx, hidden, head[2].weight, head[2].bias).t;
+            ggml_set_output(io.output);
+            ggml_build_forward_expand(graph, io.output);
+        }
     }
 };
 }
 
 // Model execution in one mode: the device, its resident weights and the graphs
-// compiled for the most recent batch shape.
+// compiled for the most recent lane shapes.
 struct runtime::impl {
     checkpoint model;
     mode m;
+    padding pad = padding::grouped;
     std::filesystem::path trace_directory;  // empty unless LAYA_TRACE_DIR is set
     std::string name, description;
     backend_handle backend;
@@ -711,6 +724,10 @@ struct runtime::impl {
     // Host memory the device copies to and from directly: pinned when the device
     // offers it, so copies queue with other work instead of each awaiting the device.
     buffer_handle transfer_buffer;
+    // Per-call scratch: lane graph keys, received outputs and option probabilities.
+    std::vector<graph_shape> shapes;
+    std::vector<int> sizes;
+    std::vector<std::span<float>> received;
     std::vector<float> probabilities;
 
     ~impl() {
@@ -771,7 +788,12 @@ struct runtime::impl {
         coreml.emplace(std::move(*bridge));
         return {};
     }
-    template<mode M> requires(has(M, feature::coreml)) result<raw_result> run(const batch& input) { return coreml->forward(input); }
+    // Core ML pads whole batches to its compiled bucket shapes, so a call is one lane.
+    template<mode M> requires(has(M, feature::coreml)) result<raw_result> forward(const batch& input) {
+        LAYA_TRY(output, coreml->forward(input));
+        output->lanes.assign(std::size_t(input.size), 0);
+        return output;
+    }
 #endif
     template<mode M> result<void> load() {
         LAYA_CHECK(load_weights(numerics<M>::layout));
@@ -905,36 +927,44 @@ struct runtime::impl {
         return {};
     }
 
-    void bind(const batch& input, transfer& io) {
-        io.send(encoder->ids, input.ids);
-        io.send(encoder->markers, input.markers);
-        io.send(encoder->lengths, input.lengths);
-        const auto types = io.take<std::int32_t>(encoder->types), cls = io.take<std::int32_t>(encoder->cls);
-        for (int row = 0; row < input.size; ++row) {
-            cls[row] = row * input.length;
-            std::fill_n(types.begin() + cls[row], input.length, input.types[row]);
+    // A lane's inputs: its rows cut to the lane length, with option markers and
+    // pooled positions counted within the lane.
+    void bind(const batch& input, const lane& g, const encoder_lane& e, transfer& io) {
+        const auto ids = io.take<std::int32_t>(e.ids), types = io.take<std::int32_t>(e.types), markers = io.take<std::int32_t>(e.markers);
+        const auto cls = io.take<std::int32_t>(e.cls), lengths = io.take<std::int32_t>(e.lengths);
+        for (int r = 0; r < g.size(); ++r) {
+            const int row = g.rows[std::size_t(r)], first = r * g.length;
+            std::copy_n(input.ids.begin() + std::ptrdiff_t(row) * input.length, g.length, ids.begin() + first);
+            std::fill_n(types.begin() + first, g.length, input.types[std::size_t(row)]);
+            for (int k = 0; k < g.options; ++k) markers[std::size_t(r) * g.options + k] = lane_marker(input, row, k, r, g.length);
+            cls[std::size_t(r)] = first;
+            lengths[std::size_t(r)] = input.lengths[std::size_t(row)];
         }
-        io.send(encoder->types, types);
-        io.send(encoder->cls, cls);
+        io.send(e.ids, ids);
+        io.send(e.types, types);
+        io.send(e.markers, markers);
+        io.send(e.cls, cls);
+        io.send(e.lengths, lengths);
     }
 
-    // Action-head features per row: pooled state, then the top probability,
-    // its margin, normalized entropy and option count of the option softmax.
-    // Logits of padded options are set to -1e4 in place.
-    void summarize(const batch& input, std::span<float> logits, std::span<const float> pooled, std::span<float> features) {
+    // Action-head features of a lane's rows: pooled state, then the top
+    // probability, its margin, normalized entropy and option count of the option
+    // softmax. Logits of padded options are set to -1e4 in place.
+    void summarize(const batch& input, const lane& g, std::span<float> logits, std::span<const float> pooled, std::span<float> features) {
         const int width = model.arch.width;
-        probabilities.resize(std::size_t(input.options));
-        for (int row = 0; row < input.size; ++row) {
-            auto* out = features.data() + std::size_t(row) * (width + 4);
-            std::copy_n(pooled.data() + std::size_t(row) * width, width, out);
-            auto* scores = logits.data() + std::size_t(row) * input.options;
-            std::fill(scores + input.counts[row], scores + input.options, -1e4f);
-            const float maximum = *std::max_element(scores, scores + input.options);
+        probabilities.resize(std::size_t(g.options));
+        for (int r = 0; r < g.size(); ++r) {
+            const int options = input.counts[std::size_t(g.rows[std::size_t(r)])];
+            auto* out = features.data() + std::size_t(r) * (width + 4);
+            std::copy_n(pooled.data() + std::size_t(r) * width, width, out);
+            auto* scores = logits.data() + std::size_t(r) * g.options;
+            std::fill(scores + options, scores + g.options, -1e4f);
+            const float maximum = *std::max_element(scores, scores + g.options);
             float total = 0, entropy = 0;
-            for (int j = 0; j < input.options; ++j) total += probabilities[j] = std::exp(scores[j] - maximum);
+            for (int j = 0; j < g.options; ++j) total += probabilities[j] = std::exp(scores[j] - maximum);
             for (auto& v : probabilities) v /= total, entropy -= v * std::log(std::max(v, 1e-9f));
             std::partial_sort(probabilities.begin(), probabilities.begin() + 2, probabilities.end(), std::greater<float>());
-            const int count = std::max(2, input.counts[row]);
+            const int count = std::max(2, options);
             out[width] = probabilities[0];
             out[width + 1] = probabilities[0] - probabilities[1];
             out[width + 2] = entropy / std::log(float(count));
@@ -956,71 +986,108 @@ struct runtime::impl {
     }
 
     // The graph for key: the slot's graph while its key matches, else one built anew.
-    template<mode M, class G> result<void> compile(std::optional<G>& slot, decltype(G::key) key, ggml_gallocr* memory) {
+    template<mode M, class G> result<void> compile(std::optional<G>& slot, const decltype(G::key)& key, ggml_gallocr* memory) {
         if (slot && slot->key == key) return {};
         slot.reset();
         G g;
         g.key = key;
-        g.context.reset(ggml_init({ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false), nullptr, true}));
+        const std::size_t nodes = 8192 * key.size();  // a lane of the largest model uses under 8192
+        g.context.reset(ggml_init({ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false), nullptr, true}));
         if (!g.context) return fail(errc::backend, "Cannot allocate graph metadata");
-        g.graph = ggml_new_graph_custom(g.context.get(), 8192, false);
+        g.graph = ggml_new_graph_custom(g.context.get(), nodes, false);
         network<M>{g.context.get(), g.graph, w, model.arch, trace_directory.empty() ? nullptr : &g.traces}.build(g);
         LAYA_CHECK(allocate(g.graph, backend.get(), memory));
         slot.emplace(std::move(g));
         return {};
     }
 
-    template<mode M> result<raw_result> run(const batch& input) {
+    // The lanes of a call share one encoder graph and one action graph; each
+    // lane computes its rows as a batch of their own.
+    template<mode M> result<raw_result> run(const batch& input, std::span<const lane> lanes) {
         // AMD Vulkan BF16 kernels flag nonfinite projection inputs on the device, once per graph.
         constexpr bool checked = has(M, feature::vulkan | feature::bf16 | feature::amd);
-        const auto check = [&](std::span<const float> values, std::span<const float> more = {}) -> result<void> {
+        const auto check = [&](std::span<const std::span<float>> outputs) -> result<void> {
             if constexpr (checked) {
-                const auto finite = [](std::span<const float> v) { return std::ranges::all_of(v, [](float x) { return std::isfinite(x); }); };
                 if (laya_vk_bf16_status_failed(backend.get())) return fail(errc::backend, "Nonfinite AMD Vulkan BF16 projection input");
-                if (!finite(values) || !finite(more)) return fail(errc::backend, "Nonfinite AMD Vulkan BF16 output");
+                for (const auto values : outputs)
+                    if (!std::ranges::all_of(values, [](float x) { return std::isfinite(x); }))
+                        return fail(errc::backend, "Nonfinite AMD Vulkan BF16 output");
             }
             return {};
         };
-        LAYA_CHECK(validate(input));
-        LAYA_CHECK(compile<M>(encoder, {input.size, input.length, input.options,
-                                        numerics<M>::mixed && std::ranges::any_of(input.lengths, [&](int n) { return n < input.length; })},
-                              encoder_memory.get()));
-        LAYA_CHECK(compile<M>(head, input.size, head_memory.get()));
+        shapes.clear(), sizes.clear();
+        for (const lane& g : lanes) {
+            const bool padded = std::ranges::any_of(g.rows, [&](int row) { return input.lengths[std::size_t(row)] < g.length; });
+            shapes.push_back({g.size(), g.length, g.options, numerics<M>::mixed && padded});
+            sizes.push_back(g.size());
+        }
+        LAYA_CHECK(compile<M>(encoder, shapes, encoder_memory.get()));
+        LAYA_CHECK(compile<M>(head, sizes, head_memory.get()));
         if constexpr (checked) laya_vk_bf16_status_reset(backend.get());  // synchronizes, so before any copy is queued
         // Inputs and outputs pass through transfer memory: their copies queue with
         // each graph, and the device is awaited once per graph.
         std::size_t bytes = 0;
-        for (const tensor* t : {encoder->ids, encoder->types, encoder->markers, encoder->cls, encoder->lengths, encoder->logits,
-                                encoder->pooled, head->input, head->output})
-            bytes += GGML_PAD(ggml_nbytes(t), 64);
+        for (const encoder_lane& e : encoder->lanes)
+            for (const tensor* t : {e.ids, e.types, e.markers, e.cls, e.lengths, e.logits, e.pooled}) bytes += GGML_PAD(ggml_nbytes(t), 64);
+        for (const action_lane& a : head->lanes)
+            for (const tensor* t : {a.input, a.output}) bytes += GGML_PAD(ggml_nbytes(t), 64);
         transfer io{backend.get(), transfer_memory(bytes)};
         if (!io.next) return fail(errc::backend, "Cannot allocate transfer memory");
-        bind(input, io);
+        for (std::size_t i = 0; i < lanes.size(); ++i) bind(input, lanes[i], encoder->lanes[i], io);
 
         const auto start = std::chrono::steady_clock::now();
         auto status = ggml_backend_graph_compute_async(io.backend, encoder->graph);
-        const auto logits = io.receive<float>(encoder->logits), pooled = io.receive<float>(encoder->pooled);
+        received.clear();  // the logits and pooled states of each lane
+        for (const encoder_lane& e : encoder->lanes) received.push_back(io.receive<float>(e.logits)), received.push_back(io.receive<float>(e.pooled));
         ggml_backend_synchronize(io.backend);
         if (status != GGML_STATUS_SUCCESS) return fail(errc::backend, "Encoder computation failed");
-        raw_result output{{logits.begin(), logits.end()}, {}, model.serving.actions};
-        LAYA_CHECK(check(output.logits, pooled));
+        LAYA_CHECK(check(received));
         if (!trace_directory.empty()) write_traces();
 
-        const auto features = io.take<float>(head->input);
-        summarize(input, output.logits, pooled, features);
-        io.send(head->input, features);
+        const int actions = model.serving.actions;
+        raw_result output;
+        output.logits.assign(std::size_t(input.size) * std::size_t(input.options), -1e4f);  // options beyond a lane's
+        output.actions.resize(std::size_t(input.size) * std::size_t(actions));
+        output.action_count = actions;
+        for (std::size_t i = 0; i < lanes.size(); ++i) {
+            const lane& g = lanes[i];
+            const auto logits = received[2 * i];
+            const auto features = io.take<float>(head->lanes[i].input);
+            summarize(input, g, logits, received[2 * i + 1], features);
+            io.send(head->lanes[i].input, features);
+            for (int r = 0; r < g.size(); ++r)
+                std::copy_n(logits.begin() + std::ptrdiff_t(r) * g.options, g.options,
+                            output.logits.begin() + std::ptrdiff_t(g.rows[std::size_t(r)]) * input.options);
+        }
         status = ggml_backend_graph_compute_async(io.backend, head->graph);
-        const auto actions = io.receive<float>(head->output);
+        received.clear();
+        for (const action_lane& a : head->lanes) received.push_back(io.receive<float>(a.output));
         ggml_backend_synchronize(io.backend);
         if (status != GGML_STATUS_SUCCESS) return fail(errc::backend, "Action computation failed");
-        output.actions.assign(actions.begin(), actions.end());
-        LAYA_CHECK(check(output.actions));
+        LAYA_CHECK(check(received));
+        for (std::size_t i = 0; i < lanes.size(); ++i)
+            for (int r = 0; r < lanes[i].size(); ++r)
+                std::copy_n(received[i].begin() + std::ptrdiff_t(r) * actions, actions,
+                            output.actions.begin() + std::ptrdiff_t(lanes[i].rows[std::size_t(r)]) * actions);
         output.compute_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        return output;
+    }
+
+    // Rows run in the lanes the padding policy plans; traces name values of a
+    // single lane, so a traced call is one lane padded to its longest row.
+    template<mode M> result<raw_result> forward(const batch& input) {
+        LAYA_CHECK(validate(input));
+        const std::vector<lane> lanes = pad == padding::grouped && trace_directory.empty() ? group_lanes(input, model.arch)
+                                                                                            : std::vector<lane>{whole(input)};
+        LAYA_TRY(output, run<M>(input, lanes));
+        output->lanes.resize(std::size_t(input.size));
+        for (std::size_t i = 0; i < lanes.size(); ++i)
+            for (const int row : lanes[i].rows) output->lanes[std::size_t(row)] = int(i);
         return output;
     }
 };
 
-result<runtime> runtime::load(const std::filesystem::path& directory, mode requested) {
+result<runtime> runtime::load(const std::filesystem::path& directory, mode requested, padding rows) {
     if (const mode missing = requested & (feature::cuda | feature::vulkan | feature::coreml) & ~built)
         return fail(errc::unsupported, std::string("This build has no ") + (missing == feature::cuda ? "CUDA backend" : missing == feature::vulkan
                                        ? "Vulkan backend" : "Core ML backend; rebuild with -DLAYA_COREML=ON on macOS arm64"));
@@ -1031,13 +1098,14 @@ result<runtime> runtime::load(const std::filesystem::path& directory, mode reque
     impl& state = *loaded.p;
     state.model = std::move(*model);
     state.m = requested;
+    state.pad = rows;
     if (const char* traces = std::getenv("LAYA_TRACE_DIR")) state.trace_directory = traces;
     LAYA_CHECK(state.open());
     if (!std::ranges::contains(modes, state.m)) return fail(errc::unsupported, "Unsupported backend and precision");
     LAYA_CHECK(dispatch(state.m, [&]<mode M> { return state.template load<M>(); }));
     return loaded;
 }
-result<raw_result> runtime::forward(const batch& input) { return dispatch(p->m, [&]<mode M> { return p->run<M>(input); }); }
+result<raw_result> runtime::forward(const batch& input) { return dispatch(p->m, [&]<mode M> { return p->forward<M>(input); }); }
 const checkpoint& runtime::model() const { return p->model; }
 const std::string& runtime::backend_name() const { return p->name; }
 const std::string& runtime::device_name() const { return p->description; }
