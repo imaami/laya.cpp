@@ -616,17 +616,16 @@ template<mode M> struct network {
         for (int kind = 0; kind < 2; ++kind) g.cosine[kind] = positions(w.cosine[kind]), g.sine[kind] = positions(w.sine[kind]);
         g.markers = input(GGML_TYPE_I32, {std::int64_t(options) * batch});
         g.cls = input(GGML_TYPE_I32, {batch});
-        // Fused attention reads mask query rows in multiples of 64.
+        // Masks are built on the device from the sequence lengths. Fused
+        // attention reads mask query rows in multiples of 64.
         constexpr bool flash = has(M, feature::flash);
         const int rows = flash ? (length + 63) / 64 * 64 : length;
-        if constexpr (has(M, feature::vulkan)) {
-            g.global_mask = input(flash ? GGML_TYPE_F16 : GGML_TYPE_F32, {length, rows, 1, batch});
-            g.local_mask = input(flash ? GGML_TYPE_F16 : GGML_TYPE_F32, {length, rows, 1, batch});
-        } else {
-            g.lengths = input(GGML_TYPE_I32, {batch});
-            g.global_mask = attention_mask(ctx, g.lengths, length, rows, false, flash);
-            g.local_mask = attention_mask(ctx, g.lengths, length, rows, true, flash);
-        }
+        g.lengths = input(GGML_TYPE_I32, {batch});
+        const auto mask = [&](bool local) {
+            if constexpr (has(M, feature::vulkan)) return vulkan_precision::attention_mask(ctx, g.lengths, length, rows, local, flash);
+            else return attention_mask(ctx, g.lengths, length, rows, local, flash);
+        };
+        g.global_mask = mask(false), g.local_mask = mask(true);
 
         const auto& e = w.encoder;
         auto* h = N::template norm<false>(ctx, ggml_get_rows(ctx, e.embeddings.tok_embeddings.weight, g.ids), e.embeddings.norm).t;
@@ -909,6 +908,7 @@ struct runtime::impl {
     void bind(const batch& input, transfer& io) {
         io.send(encoder->ids, input.ids);
         io.send(encoder->markers, input.markers);
+        io.send(encoder->lengths, input.lengths);
         const auto types = io.take<std::int32_t>(encoder->types), cls = io.take<std::int32_t>(encoder->cls);
         for (int row = 0; row < input.size; ++row) {
             cls[row] = row * input.length;
@@ -916,27 +916,6 @@ struct runtime::impl {
         }
         io.send(encoder->types, types);
         io.send(encoder->cls, cls);
-    }
-
-    // Vulkan reads host attention masks: 0 where a query may attend a key and
-    // -inf elsewhere, including the padded query rows of fused attention.
-    template<class T> void send_masks(const batch& input, transfer& io, T open, T closed) {
-        const int length = input.length, rows = int(encoder->global_mask->ne[1]), window = local_window;
-        const auto global = io.take<T>(encoder->global_mask), local = io.take<T>(encoder->local_mask);
-        std::ranges::fill(global, closed);
-        std::ranges::fill(local, closed);
-        for (int row = 0; row < input.size; ++row) {
-            const int valid = input.lengths[row];
-            for (int query = 0; query < length; ++query) {
-                const std::size_t base = (std::size_t(row) * rows + query) * length;
-                std::fill_n(global.begin() + base, valid, open);
-                const int first = std::max(0, query - window), last = std::min(valid, query + window + 1);
-                if (first < last) std::fill(local.begin() + base + first, local.begin() + base + last, open);
-                if (query >= valid + window) local[base] = open;  // beyond every valid key's window: attend the first token
-            }
-        }
-        io.send(encoder->global_mask, global);
-        if (encoder->local_mask->buffer) io.send(encoder->local_mask, local);  // unused by unpadded short fused attention
     }
 
     // Action-head features per row: pooled state, then the top probability,
@@ -1011,18 +990,12 @@ struct runtime::impl {
         // Inputs and outputs pass through transfer memory: their copies queue with
         // each graph, and the device is awaited once per graph.
         std::size_t bytes = 0;
-        for (const tensor* t : {encoder->ids, encoder->types, encoder->markers, encoder->cls, encoder->lengths, encoder->global_mask,
-                                encoder->local_mask, encoder->logits, encoder->pooled, head->input, head->output})
-            if (t && (t->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT))) bytes += GGML_PAD(ggml_nbytes(t), 64);
+        for (const tensor* t : {encoder->ids, encoder->types, encoder->markers, encoder->cls, encoder->lengths, encoder->logits,
+                                encoder->pooled, head->input, head->output})
+            bytes += GGML_PAD(ggml_nbytes(t), 64);
         transfer io{backend.get(), transfer_memory(bytes)};
         if (!io.next) return fail(errc::backend, "Cannot allocate transfer memory");
         bind(input, io);
-        if constexpr (has(M, feature::vulkan | feature::flash))
-            send_masks(input, io, ggml_fp32_to_fp16(0.0f), ggml_fp32_to_fp16(-INFINITY));
-        else if constexpr (has(M, feature::vulkan))
-            send_masks(input, io, 0.0f, -INFINITY);
-        else
-            io.send(encoder->lengths, input.lengths);
 
         const auto start = std::chrono::steady_clock::now();
         auto status = ggml_backend_graph_compute_async(io.backend, encoder->graph);

@@ -85,8 +85,9 @@ Weights stay resident. Calls to one agent must be serialized by the caller.
 There is no automatic CPU fallback on a GPU error.
 
 The Vulkan FP32 path uses portable ggml GPU operations for Q/K/V packing and
-rotary multiplication. Attention masks are prepared on the host and uploaded for
-each call, including when a cached shape has different per-row lengths. The
+rotary multiplication. Attention masks are generated on the device from the
+sequence lengths of each call, including when a cached shape has different
+per-row lengths. The
 encoder, decision layers and action projections execute on Vulkan. Cooperative
 matrix and FP16 conversion paths are disabled to retain FP32 inputs and arithmetic.
 

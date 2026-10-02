@@ -7,7 +7,7 @@ laya_vk_replace(
 # SPIR-V without a pipeline, and the norm pipeline above selects its AMD variant.
 foreach(shader norm:norm:4 amd_norm:norm:0:-DLAYA_AMD_NORM=1 activation:activation:3 split:compensated:2:-DSPLIT=1
     merge:compensated:2 reduce:compensated:2:-DREDUCE=1 serial:compensated:3:-DSERIAL=1
-    finish_projection:finish_projection:4 pack_qkv:pack_qkv:4 pad16:pad16:2)
+    finish_projection:finish_projection:4 pack_qkv:pack_qkv:4 pad16:pad16:2 mask:mask:2)
   string(REPLACE ":" ";" shader "${shader}")
   list(POP_FRONT shader name source bindings)
   set(header "${CMAKE_CURRENT_BINARY_DIR}/laya_${name}.spv.h")
@@ -36,3 +36,8 @@ laya_vk_replace(
 laya_vk_replace(
   "    switch (op->op) {\n        case GGML_OP_UNARY:"
   "    switch (op->op) {\n        case GGML_OP_CUSTOM: return laya_vk_supports(op);\n        case GGML_OP_UNARY:")
+# Per-operator timings (GGML_VK_PERF_LOGGER) continue the context holding the
+# input copies queued with each graph.
+laya_vk_replace(
+  "        GGML_ASSERT(ctx->compute_ctx.expired());\n        compute_ctx = ggml_vk_get_compute_ctx(ctx);\n        ctx->query_idx = 0;"
+  "        compute_ctx = ggml_vk_get_compute_ctx(ctx);\n        ctx->query_idx = 0;")

@@ -33,6 +33,10 @@ static bool laya_vk_supports(const ggml_tensor* op) {
     case K::norm:
         return f32(op) && flags<=2 && f32(x) && f32(b) && (!r || f32(r)) && op->ne[0]%4==0 &&
             ggml_are_same_shape(op,x) && ggml_nelements(b)==op->ne[0] && (!r || ggml_nelements(r)==op->ne[0]);
+    case K::mask:
+        return x && x->type==GGML_TYPE_I32 && ggml_is_contiguous(x) && (op->type==GGML_TYPE_F16 || op->type==GGML_TYPE_F32) &&
+            ggml_is_contiguous(op) && flags<2 && op->ne[0]>0 && op->ne[1]>=op->ne[0] && op->ne[1]<=65535 && op->ne[2]==1 &&
+            op->ne[3]==ggml_nelements(x) && op->ne[3]<=65535 && indexable;
     case K::none: break;
     }
     return false;
@@ -43,25 +47,28 @@ static void laya_vk_custom(ggml_backend_vk_context* ctx, vk_context& subctx, ggm
     const auto kind=K(op->op_params[1]);
     ggml_tensor *x=op->src[0],*b=op->src[1],*r=op->src[2];
     const uint32_t n=uint32_t(ggml_nelements(op)),rows=uint32_t(ggml_nrows(op)),flags=uint32_t(op->op_params[0]);
-    const auto run=[&](vk_pipeline& pipeline, std::array<uint32_t,4> params, uint32_t groups, auto*... buffers) {
+    const auto run=[&](vk_pipeline& pipeline, std::array<uint32_t,4> params, std::array<uint32_t,3> elements, auto*... buffers) {
         ggml_pipeline_request_descriptor_sets(ctx,pipeline,1);
         ggml_vk_dispatch_pipeline(ctx,subctx,pipeline,{vk::DescriptorBufferInfo(ggml_vk_tensor_subbuffer(ctx,buffers))...},
-            params,{groups,1,1});
+            params,elements);
     };
     auto& device=*ctx->device;
     switch (kind) {
-    case K::pad16: return run(device.pipeline_laya_pad16,{uint32_t(x->ne[0]),uint32_t(op->ne[0]),n,0},n,x,op);
-    case K::finish: return run(device.pipeline_laya_finish_projection,{uint32_t(op->ne[0]),n,flags,0},n,x,b,r,op);
-    case K::split: return run(device.pipeline_laya_split,{n/2,0,0,0},n/4,x,op);
-    case K::merge: return run(device.pipeline_laya_merge,{n,0,0,0},n,x,op);
+    case K::pad16: return run(device.pipeline_laya_pad16,{uint32_t(x->ne[0]),uint32_t(op->ne[0]),n,0},{n,1,1},x,op);
+    case K::finish: return run(device.pipeline_laya_finish_projection,{uint32_t(op->ne[0]),n,flags,0},{n,1,1},x,b,r,op);
+    case K::split: return run(device.pipeline_laya_split,{n/2,0,0,0},{n/4,1,1},x,op);
+    case K::merge: return run(device.pipeline_laya_merge,{n,0,0,0},{n,1,1},x,op);
     case K::pack_qkv:
-        return run(device.pipeline_laya_pack_qkv,{uint32_t(op->ne[1]),uint32_t(op->ne[2]),uint32_t(op->ne[3]/3),flags},n,x,b,r,op);
-    case K::serial: return run(device.pipeline_laya_serial,{n,uint32_t(x->ne[2]),uint32_t(op->ne[0]),flags},n,x,op,b);
-    case K::reduce: return run(device.pipeline_laya_reduce,{n,uint32_t(x->ne[2]),0,0},n,x,op);
-    case K::norm: return run(device.pipeline_laya_norm,{uint32_t(op->ne[0]),rows,r ? 1u : 0u,flags},rows,x,b,r ? r : x,op);
+        return run(device.pipeline_laya_pack_qkv,{uint32_t(op->ne[1]),uint32_t(op->ne[2]),uint32_t(op->ne[3]/3),flags},{n,1,1},x,b,r,op);
+    case K::serial: return run(device.pipeline_laya_serial,{n,uint32_t(x->ne[2]),uint32_t(op->ne[0]),flags},{n,1,1},x,op,b);
+    case K::reduce: return run(device.pipeline_laya_reduce,{n,uint32_t(x->ne[2]),0,0},{n,1,1},x,op);
+    case K::norm: return run(device.pipeline_laya_norm,{uint32_t(op->ne[0]),rows,r ? 1u : 0u,flags},{rows,1,1},x,b,r ? r : x,op);
+    case K::mask:
+        return run(device.pipeline_laya_mask,{uint32_t(op->ne[0]),uint32_t(op->ne[1]),flags|(op->type==GGML_TYPE_F16 ? 2u : 0u),0},
+            {uint32_t(op->ne[0]),uint32_t(op->ne[1]),uint32_t(op->ne[3])},x,op);
     case K::none: GGML_ABORT("Unsupported Laya Vulkan operator");
     default:
         return run(device.pipeline_laya_activation,{uint32_t(op->ne[0]),rows,kind<=K::mlp_f16 ? 1u : 0u,
-            kind==K::mlp_bf16 || kind==K::gelu_bf16 ? 1u : 0u},n,x,b,op);
+            kind==K::mlp_bf16 || kind==K::gelu_bf16 ? 1u : 0u},{n,1,1},x,b,op);
     }
 }

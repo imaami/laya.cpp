@@ -8,10 +8,10 @@ namespace laya::vulkan_precision {
 // Custom nodes run only by the patched Vulkan backend (vulkan_dispatch.hpp):
 // op_params[0] carries the operator flags and op_params[1] the operator, which
 // the name confirms once, when the backend admits the node.
-enum class op { pad16, finish, split, merge, pack_qkv, serial, reduce, mlp_bf16, mlp_f16, gelu_bf16, gelu_f16, norm, none };
+enum class op { pad16, finish, split, merge, pack_qkv, serial, reduce, mlp_bf16, mlp_f16, gelu_bf16, gelu_f16, norm, mask, none };
 inline constexpr const char* op_names[]={"laya.pad16-vulkan","laya.finish-projection-vulkan","laya.split-vulkan",
     "laya.merge-vulkan","laya.pack-qkv-vulkan","laya.serial-vulkan","laya.reduce-vulkan","laya.mlp-bf16-vulkan",
-    "laya.mlp-f16-vulkan","laya.gelu-bf16-vulkan","laya.gelu-f16-vulkan","laya.norm-vulkan"};
+    "laya.mlp-f16-vulkan","laya.gelu-bf16-vulkan","laya.gelu-f16-vulkan","laya.norm-vulkan","laya.mask-vulkan"};
 inline op kind(const ggml_tensor* t) {
     const auto k=uint32_t(t->op_params[1]);
     return k<uint32_t(op::none) && !std::strcmp(t->name,op_names[k]) ? op(k) : op::none;
@@ -84,5 +84,14 @@ inline ggml_tensor* activation(ggml_context* ctx, ggml_tensor* x, ggml_tensor* t
 inline ggml_tensor* norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias,
                          ggml_type stored_type=GGML_TYPE_F32) {
     return custom(ctx,op::norm,GGML_TYPE_F32,{x->ne[0],x->ne[1],x->ne[2],x->ne[3]},{x,weight,bias},storage(stored_type));
+}
+// 0 where a query may attend a key and -inf elsewhere, from the valid length of
+// each sequence. Local masks open keys within 64 positions, and the first key for
+// padded queries beyond every valid key's window; query rows past the sequence,
+// which fused attention reads in multiples of 64, stay closed.
+inline ggml_tensor* attention_mask(ggml_context* ctx, ggml_tensor* lengths, int64_t length, int64_t rows, bool local, bool half) {
+    if (lengths->type!=GGML_TYPE_I32 || !ggml_is_contiguous(lengths) || length<1 || rows<length)
+        GGML_ABORT("Invalid attention mask shape");
+    return custom(ctx,op::mask,half ? GGML_TYPE_F16 : GGML_TYPE_F32,{length,rows,1,ggml_nelements(lengths)},{lengths},local ? 1 : 0);
 }
 }

@@ -53,6 +53,41 @@ int main() {
         if (actual!=expected || actual!=legacy) laya::test::fail("16-bit padding changed storage bits");
         ggml_gallocr_free(allocator); ggml_free(ctx);
     }
+    // Device masks match the host masks Vulkan attention once uploaded, and
+    // follow changed lengths when a graph is replayed.
+    for (bool half : {false,true}) for (bool local : {false,true})
+    for (const auto& calls : {std::vector<std::vector<int32_t>>{{1,70,135,200},{200,136,64,2}},{{5,1,3},{2,5,5}}}) {
+        const int batch=int(calls[0].size()),length=*std::ranges::max_element(calls[0]),rows=half ? (length+63)/64*64 : length;
+        auto ctx=ggml_init({8*ggml_tensor_overhead()+ggml_graph_overhead(),nullptr,true});
+        auto lengths=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,batch);
+        ggml_set_input(lengths);
+        auto output=laya::vulkan_precision::attention_mask(ctx,lengths,length,rows,local,half);
+        if (!ggml_backend_supports_op(backend,output)) laya::test::fail("Attention mask unsupported");
+        ggml_set_output(output);
+        auto graph=ggml_new_graph(ctx); ggml_build_forward_expand(graph,output);
+        auto allocator=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(allocator,graph)) laya::test::fail("Attention mask allocation failed");
+        const size_t size=half ? 2 : 4;
+        const uint32_t closed=half ? 0xfc00u : 0xff800000u;
+        for (const auto& valid : calls) {
+            std::vector<uint32_t> expected(size_t(length)*rows*batch,closed);
+            for (int row=0;row<batch;++row) for (int query=0;query<length;++query) {
+                auto* line=expected.data()+(size_t(row)*rows+query)*length;
+                for (int key=0;key<valid[row];++key) if (!local || std::abs(query-key)<=64) line[key]=0;
+                if (local && query>=valid[row]+64) line[0]=0;
+            }
+            ggml_backend_tensor_set(lengths,valid.data(),0,ggml_nbytes(lengths));
+            if (ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) laya::test::fail("Attention mask compute failed");
+            std::vector<uint8_t> actual(ggml_nbytes(output));
+            ggml_backend_tensor_get(output,actual.data(),0,actual.size());
+            for (size_t i=0;i<expected.size();++i) {
+                uint32_t bits=0;
+                std::memcpy(&bits,actual.data()+i*size,size);
+                if (bits!=expected[i]) laya::test::fail("Attention mask differs from the host mask");
+            }
+        }
+        ggml_gallocr_free(allocator); ggml_free(ctx);
+    }
     for (ggml_type type : {GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16})
     for (bool biased : {false,true}) for (bool residual : {false,true}) {
         constexpr int width=257,rows=3,count=width*rows;

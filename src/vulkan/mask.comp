@@ -1,0 +1,21 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+layout(binding=0) readonly buffer Lengths { int lengths[]; };
+layout(binding=1) writeonly buffer Half { uint16_t half_mask[]; };
+layout(binding=1) writeonly buffer Single { uint single_mask[]; };
+layout(push_constant) uniform Params { uint keys,rows,flags,unused; } p;
+// One invocation per element: x is the key, y the query row and z the sequence.
+// Flags: 1 selects the local window, 2 the FP16 encoding of 0 and -inf.
+void main() {
+    const uint key=gl_GlobalInvocationID.x,query=gl_GlobalInvocationID.y,sequence=gl_GlobalInvocationID.z;
+    if (key>=p.keys) return;
+    const int valid=lengths[sequence];
+    const bool real=query<p.keys;  // query rows past the sequence stay closed
+    bool open=real && int(key)<valid;
+    if ((p.flags&1u)!=0u) open=open && abs(int(query)-int(key))<=64 || real && key==0u && int(query)>=valid+64;
+    const uint i=(sequence*p.rows+query)*p.keys+key;
+    if ((p.flags&2u)!=0u) half_mask[i]=open ? uint16_t(0) : uint16_t(0xfc00);
+    else single_mask[i]=open ? 0u : 0xff800000u;
+}
