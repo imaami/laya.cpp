@@ -5,16 +5,16 @@
 #include <initializer_list>
 #include <limits>
 namespace laya::vulkan_precision {
-// Custom nodes run only by the patched Vulkan backend: the name selects the
-// shader (vulkan_dispatch.hpp) and op_params[0] carries the operator flags.
+// Custom nodes run only by the patched Vulkan backend (vulkan_dispatch.hpp):
+// op_params[0] carries the operator flags and op_params[1] the operator, which
+// the name confirms once, when the backend admits the node.
 enum class op { pad16, finish, split, merge, pack_qkv, serial, reduce, mlp_bf16, mlp_f16, gelu_bf16, gelu_f16, norm, none };
 inline constexpr const char* op_names[]={"laya.pad16-vulkan","laya.finish-projection-vulkan","laya.split-vulkan",
     "laya.merge-vulkan","laya.pack-qkv-vulkan","laya.serial-vulkan","laya.reduce-vulkan","laya.mlp-bf16-vulkan",
     "laya.mlp-f16-vulkan","laya.gelu-bf16-vulkan","laya.gelu-f16-vulkan","laya.norm-vulkan"};
 inline op kind(const ggml_tensor* t) {
-    int i=0;
-    while (i<int(op::none) && std::strcmp(t->name,op_names[i])) ++i;
-    return op(i);
+    const auto k=uint32_t(t->op_params[1]);
+    return k<uint32_t(op::none) && !std::strcmp(t->name,op_names[k]) ? op(k) : op::none;
 }
 [[noreturn]] inline void no_cpu(ggml_tensor*, int, int, void*) { GGML_ABORT("Laya Vulkan operators require a Vulkan GPU"); }
 inline ggml_tensor* custom(ggml_context* ctx, op kind, ggml_type type, std::array<int64_t,4> ne,
@@ -24,6 +24,7 @@ inline ggml_tensor* custom(ggml_context* ctx, op kind, ggml_type type, std::arra
     for (auto input:inputs) if (input) args[count++]=input;
     auto output=ggml_custom_4d(ctx,type,ne[0],ne[1],ne[2],ne[3],args,count,no_cpu,1,nullptr);
     output->op_params[0]=flags;
+    output->op_params[1]=int32_t(kind);
     ggml_set_name(output,op_names[int(kind)]);
     return output;
 }

@@ -40,7 +40,7 @@ static bool laya_vk_supports(const ggml_tensor* op) {
 // The scheduler admits only nodes accepted above, so dispatch needs no checks.
 static void laya_vk_custom(ggml_backend_vk_context* ctx, vk_context& subctx, ggml_tensor* op) {
     using K=laya::vulkan_precision::op;
-    const auto kind=laya::vulkan_precision::kind(op);
+    const auto kind=K(op->op_params[1]);
     ggml_tensor *x=op->src[0],*b=op->src[1],*r=op->src[2];
     const uint32_t n=uint32_t(ggml_nelements(op)),rows=uint32_t(ggml_nrows(op)),flags=uint32_t(op->op_params[0]);
     const auto run=[&](vk_pipeline& pipeline, std::array<uint32_t,4> params, uint32_t groups, auto*... buffers) {

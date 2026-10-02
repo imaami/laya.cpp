@@ -20,16 +20,13 @@ const char* laya_cuda_bf16_compatibility_error();
 #endif
 #include <algorithm>
 #include <bit>
-#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <span>
-#include <unordered_map>
 
 namespace laya {
 namespace {
@@ -180,17 +177,15 @@ template<class T> std::int32_t largest_magnitude(std::span<const T> payload) {
 // How a checkpoint tensor is stored on the device; the mode maps each role to a type.
 enum class role : std::uint8_t {
     table,       // embeddings and normalization parameters: FP32
-    bias,        // projection bias: FP32 holding product-precision values
+    bias,        // projection bias: FP32 holding values rounded to product precision
     projection,  // decision-head matrix: product precision
     trunk,       // encoder and head-layer matrix: product precision or compensated FP16
 };
 struct storage {
-    ggml_type trunk = GGML_TYPE_F32, projection = GGML_TYPE_F32;
-    ggml_type bias = GGML_TYPE_F32;    // biases hold values rounded through this type
-    bool f16_checkpoint = false;       // trunk matrices must already be F16 in the checkpoint
-    bool amd_bf16_range = false;       // BF16 matrices must convert exactly in AMD Vulkan kernels
-    ggml_type gelu = GGML_TYPE_COUNT;  // Vulkan mixed-precision GELU lookup values, if any
-    bool rocm_gelu = false;            // apply the ROCm GELU table patches
+    ggml_type trunk = GGML_TYPE_F32, projection = GGML_TYPE_F32;  // biases round through the projection type
+    bool f16_checkpoint = false;  // trunk matrices must already be F16 in the checkpoint
+    bool amd_bf16_range = false;  // BF16 matrices must convert exactly in AMD Vulkan kernels
+    bool gelu_table = false;      // GELU values are looked up
 };
 
 // Checkpoint tensors by their safetensors names: "encoder.layers.3.attn.Wqkv.weight"
@@ -396,7 +391,7 @@ struct numerics<M> {
 template<mode M> requires(has(M, feature::cuda | feature::bf16))
 struct numerics<M> {
     static constexpr ggml_type low = GGML_TYPE_BF16;
-    static constexpr storage layout{.trunk = low, .projection = low, .bias = low};
+    static constexpr storage layout{.trunk = low, .projection = low};
     static constexpr bool mixed = true, fused_residual = true, transposed_head = false, split_mlp = false;
 
     template<bool Compact> static operand<Compact> norm(ggml_context* ctx, tensor* x, const weights::linear& affine) {
@@ -431,8 +426,7 @@ template<mode M> requires(has(M, feature::vulkan) && (M & feature::low) != 0)
 struct numerics<M> {
     static constexpr ggml_type low = has(M, feature::fp16) ? GGML_TYPE_F16 : GGML_TYPE_BF16;
     static constexpr bool bf16 = low == GGML_TYPE_BF16, amd = has(M, feature::amd), nvidia = has(M, feature::nvidia);
-    static constexpr storage layout{.trunk = low, .projection = low, .bias = low, .amd_bf16_range = amd && bf16,
-                                    .gelu = low, .rocm_gelu = amd};
+    static constexpr storage layout{.trunk = low, .projection = low, .amd_bf16_range = amd && bf16, .gelu_table = true};
     static constexpr bool mixed = true, fused_residual = true, split_mlp = false;
     static constexpr bool transposed_head = amd;  // AMD batched heads project in a sequence-major layout
 
@@ -476,9 +470,19 @@ struct numerics<M> {
             return explicit_attention<amd>(ctx, q, k, v, mask, at);
         }
     }
-    // Rotary tables reproduce the rounded values of the matched device library.
+    // Rotary and GELU tables reproduce the rounded values of the matched device library.
     static std::pair<float, float> rotary(int base, float, int position, int i) {
         return {vulkan_precision::rotary(amd, base, position, i, false), vulkan_precision::rotary(amd, base, position, i, true)};
+    }
+    static std::vector<float> gelu_values() {
+        using namespace vulkan_precision;
+        const auto widen = [](std::uint16_t bits) { return bf16 ? ggml_bf16_to_fp32(ggml_bf16_t{bits}) : ggml_fp16_to_fp32(ggml_fp16_t(bits)); };
+        std::vector<float> values(65536);
+        std::ranges::transform(bf16 ? gelu_bf16_nvidia : gelu_fp16_nvidia, values.begin(), widen);
+        if constexpr (amd)
+            for (const auto patch : bf16 ? std::span<const gelu_patch>(gelu_bf16_rocm) : std::span<const gelu_patch>(gelu_fp16_rocm))
+                values[patch.index] = widen(patch.value);
+        return values;
     }
 };
 
@@ -490,36 +494,29 @@ struct graph_shape {
     friend bool operator==(const graph_shape&, const graph_shape&) = default;
 };
 using trace_list = std::vector<std::pair<std::string, tensor*>>;
-struct compiled_graph {
+// A built graph is reused while its key matches the call.
+template<class Key> struct compiled_graph {
+    Key key;
     context_handle context;
     ggml_cgraph* graph = nullptr;
+    trace_list traces;  // kept values, for LAYA_TRACE_DIR
 };
-struct encoder_graph : compiled_graph {
-    graph_shape shape;
+struct encoder_graph : compiled_graph<graph_shape> {
     tensor *ids = nullptr, *types = nullptr, *markers = nullptr, *cls = nullptr, *lengths = nullptr;
     tensor *global_mask = nullptr, *local_mask = nullptr, *pooled = nullptr, *logits = nullptr;
-    std::array<tensor*, 2> cosine{}, sine{};  // global and local rotary tables
-    trace_list traces;
+    std::array<tensor*, 2> cosine{}, sine{};  // global and local rotary rows
 };
-struct action_graph : compiled_graph {
-    int batch = 0;
+struct action_graph : compiled_graph<int> {  // keyed by batch size
     tensor *input = nullptr, *output = nullptr;
 };
 
-result<void> begin(compiled_graph& g) {
-    g.context.reset(ggml_init({ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false), nullptr, true}));
-    if (!g.context) return fail(errc::backend, "Cannot allocate graph metadata");
-    g.graph = ggml_new_graph_custom(g.context.get(), 8192, false);
-    return {};
-}
 // Checks backend support and allocates every intermediate of a built graph:
 // a fresh plan per graph in device memory that is kept and only ever grows.
-result<void> allocate(compiled_graph& g, ggml_backend_t backend, ggml_gallocr* memory) {
-    for (int i = 0; i < ggml_graph_n_nodes(g.graph); ++i)
-        if (const auto* node = ggml_graph_node(g.graph, i); !ggml_backend_supports_op(backend, node))
+result<void> allocate(ggml_cgraph* graph, ggml_backend_t backend, ggml_gallocr* memory) {
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i)
+        if (const auto* node = ggml_graph_node(graph, i); !ggml_backend_supports_op(backend, node))
             return fail(errc::unsupported, std::string("Requested backend does not support ") + ggml_op_name(node->op));
-    if (!ggml_gallocr_reserve(memory, g.graph) || !ggml_gallocr_alloc_graph(memory, g.graph))
-        return fail(errc::backend, "Insufficient memory for this batch");
+    if (!ggml_gallocr_reserve(memory, graph) || !ggml_gallocr_alloc_graph(memory, graph)) return fail(errc::backend, "Insufficient memory for this batch");
     return {};
 }
 // Keeps a graph value for LAYA_TRACE_DIR, named scope + layer + suffix.
@@ -539,18 +536,8 @@ template<mode M> struct network {
     const architecture& arch;
     trace_list* traces;  // null unless tracing
 
-    static result<encoder_graph> encoder(ggml_backend_t backend, ggml_gallocr* memory, const weights& w, const architecture& arch,
-                                         graph_shape shape, bool trace) {
-        encoder_graph g;
-        g.shape = shape;
-        LAYA_CHECK(begin(g));
-        network{g.context.get(), w, arch, trace ? &g.traces : nullptr}.build(g);
-        LAYA_CHECK(allocate(g, backend, memory));
-        return g;
-    }
-
-    // Rotary rows depend on the position only: computed once for every servable position.
-    static void rotary_tables(const weights& w, const architecture& arch, int positions) {
+    // Resident tables: rotary rows of every servable position and any GELU lookup values.
+    static void tables(const weights& w, const architecture& arch, int positions) {
         std::vector<float> cosine(64 * std::size_t(positions)), sine(cosine.size());
         for (int kind = 0; kind < 2; ++kind) {
             const int base = kind == 0 || arch.local_rope == global_rope ? 0 : 1;
@@ -565,22 +552,7 @@ template<mode M> struct network {
             put(w.cosine[kind], cosine);
             put(w.sine[kind], sine);
         }
-    }
-
-    // The action head over pooled features and option statistics.
-    static result<action_graph> actions(ggml_backend_t backend, ggml_gallocr* memory, const weights& w, const architecture& arch, int batch) {
-        action_graph g;
-        g.batch = batch;
-        LAYA_CHECK(begin(g));
-        network n{g.context.get(), w, arch, nullptr};
-        g.input = n.input(GGML_TYPE_F32, {arch.width + 4, batch});
-        const auto& head = w.act_head;
-        auto hidden = N::gelu(n.ctx, w.gelu_table, N::template linear<role::projection>(n.ctx, wide{g.input}, head[0].weight, head[0].bias));
-        g.output = N::template linear<role::projection>(n.ctx, hidden, head[2].weight, head[2].bias).t;
-        ggml_set_output(g.output);
-        ggml_build_forward_expand(g.graph, g.output);
-        LAYA_CHECK(allocate(g, backend, memory));
-        return g;
+        if constexpr (N::layout.gelu_table) put(w.gelu_table, N::gelu_values());
     }
 
     tensor* input(ggml_type type, std::initializer_list<std::int64_t> dimensions) {
@@ -626,7 +598,7 @@ template<mode M> struct network {
     }
 
     void build(encoder_graph& g) {
-        const auto [batch, length, options, padding] = g.shape;
+        const auto [batch, length, options, padding] = g.key;
         const std::int64_t tokens = std::int64_t(length) * batch;
         g.ids = input(GGML_TYPE_I32, {tokens});
         g.types = input(GGML_TYPE_I32, {tokens});
@@ -697,6 +669,16 @@ template<mode M> struct network {
         ggml_build_forward_expand(g.graph, g.pooled);
         ggml_build_forward_expand(g.graph, g.logits);
     }
+
+    // The action head over pooled features and option statistics.
+    void build(action_graph& g) {
+        g.input = input(GGML_TYPE_F32, {arch.width + 4, g.key});
+        const auto& head = w.act_head;
+        auto hidden = N::gelu(ctx, w.gelu_table, N::template linear<role::projection>(ctx, wide{g.input}, head[0].weight, head[0].bias));
+        g.output = N::template linear<role::projection>(ctx, hidden, head[2].weight, head[2].bias).t;
+        ggml_set_output(g.output);
+        ggml_build_forward_expand(g.graph, g.output);
+    }
 };
 }
 
@@ -745,8 +727,8 @@ struct runtime::impl {
             name = "coreml", description = "Core ML (all compute units)";
             return {};
         }
+    #if LAYA_CUDA
         if (has(m, cuda)) {
-#if LAYA_CUDA
             // cuBLAS enables TF32 by default; strict FP32 withdraws that permission before CUDA initializes.
 #ifdef _WIN32
             if (!(m & low) && _putenv_s("NVIDIA_TF32_OVERRIDE", "0") != 0)
@@ -757,14 +739,10 @@ struct runtime::impl {
             backend.reset(ggml_backend_cuda_init(0));
             if (backend && (m & low))
                 if (const char* reason = laya_cuda_bf16_compatibility_error()) return fail(errc::unsupported, reason);
-#else
-            return fail(errc::unsupported, "This build has no CUDA backend");
-#endif
         }
+#endif
 #if LAYA_VULKAN
         if (has(m, vulkan)) backend.reset(ggml_backend_vk_init(0));
-#else
-        if (has(m, vulkan)) return fail(errc::unsupported, "This build has no Vulkan backend");
 #endif
         if (has(m, cpu)) backend.reset(ggml_backend_cpu_init());
         if (!backend) return fail(errc::backend, "Cannot initialize requested backend");
@@ -788,7 +766,7 @@ struct runtime::impl {
 #endif
     template<mode M> result<void> load() {
         LAYA_CHECK(load_weights(numerics<M>::layout));
-        network<M>::rotary_tables(w, model.arch, model.serving.max_len);
+        network<M>::tables(w, model.arch, model.serving.max_len);
         const auto type = ggml_backend_get_default_buffer_type(backend.get());
         encoder_memory.reset(ggml_gallocr_new(type));
         head_memory.reset(ggml_gallocr_new(type));
@@ -809,30 +787,24 @@ struct runtime::impl {
         auto header = parse_json(text);
         if (!header) return fail(errc::model, std::move(header.error().message));
 
+        // Tensors are validated and created in schema order before any device memory is used.
         const auto list = entries(w, model.arch, model.serving.actions);
-        std::unordered_map<std::string_view, const entry*> schema;
-        for (const auto& e : list) {
-            schema.emplace(e.name, &e);
-            if (field(field(*header, e.name), "shape") != json(e.shape))
-                return fail(errc::model, "Missing or incorrectly shaped checkpoint tensor: " + e.name);
-        }
-        for (const auto& [key, spec] : header->items())
-            if (key != "__metadata__" && !schema.contains(key)) return fail(errc::model, "Unexpected checkpoint tensor: " + key);
-
         context.reset(ggml_init({(list.size() + 5) * ggml_tensor_overhead() + 1024, nullptr, true}));
         if (!context) return fail(errc::backend, "Cannot allocate weight metadata");
-        // Tensors are created in checkpoint order.
-        for (const auto& [key, spec] : header->items()) {
-            if (key == "__metadata__") continue;
-            const auto& e = *schema.find(key)->second;
+        for (const auto& e : list) {
+            const json& spec = field(*header, e.name);
+            if (field(spec, "shape") != json(e.shape)) return fail(errc::model, "Missing or incorrectly shaped checkpoint tensor: " + e.name);
             if (layout.f16_checkpoint && e.kind == role::trunk && field(spec, "dtype") != "F16")
                 return fail(errc::model, "Compensated Tensor Core mode requires F16 stored projections");
             const std::vector<std::int64_t> shape(e.shape.rbegin(), e.shape.rend());
             const ggml_type type = e.kind == role::trunk ? layout.trunk : e.kind == role::projection ? layout.projection : GGML_TYPE_F32;
             *e.slot = ggml_new_tensor(context.get(), type, int(shape.size()), shape.data());
-            ggml_set_name(*e.slot, key.c_str());
+            ggml_set_name(*e.slot, e.name.c_str());
         }
-        if (layout.gelu != GGML_TYPE_COUNT) w.gelu_table = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, 65536);
+        for (const auto& [key, spec] : header->items())
+            if (key != "__metadata__" && std::ranges::find(list, key, &entry::name) == list.end())
+                return fail(errc::model, "Unexpected checkpoint tensor: " + key);
+        if (layout.gelu_table) w.gelu_table = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, 65536);
         for (int kind = 0; kind < 2; ++kind) {
             w.cosine[kind] = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 64, model.serving.max_len);
             w.sine[kind] = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 64, model.serving.max_len);
@@ -841,11 +813,8 @@ struct runtime::impl {
         if (!buffer) return fail(errc::backend, "Insufficient device memory for model weights");
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        // Payloads are validated and uploaded in name order, in bounded chunks. A payload
-        // already in its device type is uploaded as read; others convert exactly through FP32.
-        std::vector<const entry*> order;
-        for (const auto& e : list) order.push_back(&e);
-        std::ranges::sort(order, {}, &entry::name);
+        // Payloads are validated and uploaded in bounded chunks. A payload already
+        // in its device type is uploaded as read; others convert exactly through FP32.
         const std::uint64_t payload_size = file_size - 8 - header_size;
         constexpr std::size_t chunk = std::size_t(1) << 22, capacity = chunk * sizeof(float);  // elements and bytes per transfer
         std::byte* const staged = transfer_memory(capacity);
@@ -853,20 +822,20 @@ struct runtime::impl {
         std::vector<std::uint16_t> half(chunk);  // 16-bit payloads and device values
         std::vector<float> values(chunk);        // F32 payloads and widened values
         std::size_t queued = 0;                  // transfer memory read by queued copies
-        std::bitset<32768> exact;                // BF16 magnitudes AMD kernels convert exactly to F16
+        std::array<bool, 32768> exact{};         // BF16 magnitudes AMD kernels convert exactly to F16
         if (layout.amd_bf16_range)
             for (uint magnitude = 0; magnitude < exact.size(); ++magnitude) exact[magnitude] = layaBf16ScaledFitsHalf(magnitude, 0);
-        for (const auto* e : order) {
-            auto* t = *e->slot;
-            const auto& spec = field(*header, e->name);
+        for (const auto& e : list) {
+            auto* t = *e.slot;
+            const auto& spec = field(*header, e.name);
             const auto &offsets = field(spec, "data_offsets"), &dtype = field(spec, "dtype");
             const ggml_type source = dtype == "F16" ? GGML_TYPE_F16 : dtype == "BF16" ? GGML_TYPE_BF16 : dtype == "F32" ? GGML_TYPE_F32 : GGML_TYPE_COUNT;
             const auto count = std::size_t(ggml_nelements(t));
             const bool valid = offsets.is_array() && offsets.size() == 2 && offsets[0].is_number_unsigned() && offsets[1].is_number_unsigned();
             const auto begin = valid ? offsets[0].get<std::uint64_t>() : 0, end = valid ? offsets[1].get<std::uint64_t>() : 0;
             if (!valid || source == GGML_TYPE_COUNT || end < begin || end > payload_size || end - begin != count * ggml_type_size(source))
-                return fail(errc::model, "Invalid safetensors payload: " + e->name);
-            const bool wide = source == GGML_TYPE_F32, rounded_bias = e->kind == role::bias && layout.bias != GGML_TYPE_F32;
+                return fail(errc::model, "Invalid safetensors payload: " + e.name);
+            const bool wide = source == GGML_TYPE_F32, rounded_bias = e.kind == role::bias && layout.projection != GGML_TYPE_F32;
             const std::size_t size = ggml_type_size(t->type);
             bool finite = true, in_range = true;  // reported once the whole payload is read
             file.seekg(std::streamoff(8 + header_size + begin));
@@ -879,46 +848,35 @@ struct runtime::impl {
                 const std::span half_part(t->type == GGML_TYPE_F32 ? half.data() : reinterpret_cast<std::uint16_t*>(device), n);
                 auto* bf16 = reinterpret_cast<ggml_bf16_t*>(half_part.data());
                 file.read(wide ? reinterpret_cast<char*>(wide_part.data()) : reinterpret_cast<char*>(half_part.data()), std::streamsize(n * ggml_type_size(source)));
-                if (!file) return fail(errc::model, "Truncated tensor payload: " + e->name);
+                if (!file) return fail(errc::model, "Truncated tensor payload: " + e.name);
                 finite &= (wide ? largest_magnitude<float>(wide_part) : largest_magnitude<std::uint16_t>(half_part)) < infinity(source);
                 if (t->type != source || rounded_bias) {
                     if (source == GGML_TYPE_F16) ggml_fp16_to_fp32_row(half_part.data(), wide_part.data(), std::int64_t(n));
                     if (source == GGML_TYPE_BF16) ggml_bf16_to_fp32_row(bf16, wide_part.data(), std::int64_t(n));
-                    if (rounded_bias && layout.bias == GGML_TYPE_F16)
+                    if (rounded_bias && layout.projection == GGML_TYPE_F16)
                         for (auto& x : wide_part) x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
-                    if (rounded_bias && layout.bias == GGML_TYPE_BF16)
+                    if (rounded_bias && layout.projection == GGML_TYPE_BF16)
                         for (auto& x : wide_part) x = ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
                     if (t->type == GGML_TYPE_F16) ggml_fp32_to_fp16_row(wide_part.data(), half_part.data(), std::int64_t(n));
                     if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(wide_part.data(), bf16, std::int64_t(n));
                 }
                 if (layout.amd_bf16_range && t->type == GGML_TYPE_BF16)
-                    in_range &= std::ranges::all_of(half_part, [&](std::uint16_t x) { return exact[x & 0x7fff]; });
+                    for (const std::uint16_t x : half_part) in_range &= exact[x & 0x7fff];
                 ggml_backend_tensor_set_async(backend.get(), t, device, done * size, n * size);
                 queued += GGML_PAD(n * size, 64);
             }
-            if (!finite) return fail(errc::model, "Nonfinite checkpoint values: " + e->name);
-            if (!in_range) return fail(errc::model, "AMD Vulkan BF16 projection weights exceed exact conversion range: " + e->name);
+            if (!finite) return fail(errc::model, "Nonfinite checkpoint values: " + e.name);
+            if (!in_range) return fail(errc::model, "AMD Vulkan BF16 projection weights exceed exact conversion range: " + e.name);
         }
         ggml_backend_synchronize(backend.get());
-        if (auto* table = w.gelu_table) {
-            using namespace vulkan_precision;
-            const bool half = layout.gelu == GGML_TYPE_F16;
-            const auto widen = [half](std::uint16_t bits) { return half ? ggml_fp16_to_fp32(ggml_fp16_t(bits)) : ggml_bf16_to_fp32(ggml_bf16_t{bits}); };
-            values.resize(65536);
-            std::ranges::transform(half ? std::span(gelu_fp16_nvidia) : std::span(gelu_bf16_nvidia), values.begin(), widen);
-            if (layout.rocm_gelu)
-                for (const auto patch : half ? std::span<const gelu_patch>(gelu_fp16_rocm) : std::span<const gelu_patch>(gelu_bf16_rocm))
-                    values[patch.index] = widen(patch.value);
-            put(table, values);
-        }
         return {};
     }
 
     result<void> validate(const batch& input) const {
-        if (input.size < 1 || input.length < 1 || input.length > model.serving.max_len || input.options < 2 ||
-            input.ids.size() != std::size_t(input.size) * std::size_t(input.length))
-            return fail(errc::backend, "Invalid model batch");
         const auto rows = std::size_t(input.size);
+        if (input.size < 1 || input.length < 1 || input.length > model.serving.max_len || input.options < 2 ||
+            input.ids.size() != rows * std::size_t(input.length))
+            return fail(errc::backend, "Invalid model batch");
         if (input.lengths.size() != rows || input.types.size() != rows || input.counts.size() != rows ||
             input.markers.size() != rows * std::size_t(input.options))
             return fail(errc::backend, "Invalid batch metadata sizes");
@@ -996,45 +954,47 @@ struct runtime::impl {
     void write_traces() const {
         std::error_code ignored;
         std::filesystem::create_directories(trace_directory, ignored);
-        std::vector<float> values;
-        std::vector<ggml_bf16_t> packed;
         for (const auto& [name, t] : encoder->traces) {
-            values.resize(std::size_t(ggml_nelements(t)));
-            if (t->type == GGML_TYPE_BF16) {
-                packed.resize(values.size());
-                ggml_backend_tensor_get(t, packed.data(), 0, ggml_nbytes(t));
-                ggml_bf16_to_fp32_row(packed.data(), values.data(), std::int64_t(values.size()));
-            } else {
-                ggml_backend_tensor_get(t, values.data(), 0, ggml_nbytes(t));
-            }
+            std::vector<float> values(std::size_t(ggml_nelements(t)));
+            std::vector<ggml_bf16_t> packed(t->type == GGML_TYPE_BF16 ? values.size() : 0);
+            ggml_backend_tensor_get(t, packed.empty() ? static_cast<void*>(values.data()) : packed.data(), 0, ggml_nbytes(t));
+            ggml_bf16_to_fp32_row(packed.data(), values.data(), std::int64_t(packed.size()));
             std::ofstream(trace_directory / (name + ".f32"), std::ios::binary)
                 .write(reinterpret_cast<const char*>(values.data()), std::streamsize(values.size() * sizeof(float)));
         }
     }
 
+    // The graph for key: the slot's graph while its key matches, else one built anew.
+    template<mode M, class G> result<void> compile(std::optional<G>& slot, decltype(G::key) key, ggml_gallocr* memory) {
+        if (slot && slot->key == key) return {};
+        slot.reset();
+        G g;
+        g.key = key;
+        g.context.reset(ggml_init({ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false), nullptr, true}));
+        if (!g.context) return fail(errc::backend, "Cannot allocate graph metadata");
+        g.graph = ggml_new_graph_custom(g.context.get(), 8192, false);
+        network<M>{g.context.get(), w, model.arch, trace_directory.empty() ? nullptr : &g.traces}.build(g);
+        LAYA_CHECK(allocate(g.graph, backend.get(), memory));
+        slot.emplace(std::move(g));
+        return {};
+    }
+
     template<mode M> result<raw_result> run(const batch& input) {
-        // AMD Vulkan BF16 kernels flag nonfinite projection inputs on the device.
+        // AMD Vulkan BF16 kernels flag nonfinite projection inputs on the device, once per graph.
         constexpr bool checked = has(M, feature::vulkan | feature::bf16 | feature::amd);
-        const auto check = [&](std::span<const float> values) -> result<void> {
+        const auto check = [&](std::span<const float> values, std::span<const float> more = {}) -> result<void> {
             if constexpr (checked) {
+                const auto finite = [](std::span<const float> v) { return std::ranges::all_of(v, [](float x) { return std::isfinite(x); }); };
                 if (laya_vk_bf16_status_failed(backend.get())) return fail(errc::backend, "Nonfinite AMD Vulkan BF16 projection input");
-                if (!std::ranges::all_of(values, [](float x) { return std::isfinite(x); })) return fail(errc::backend, "Nonfinite AMD Vulkan BF16 output");
+                if (!finite(values) || !finite(more)) return fail(errc::backend, "Nonfinite AMD Vulkan BF16 output");
             }
             return {};
         };
         LAYA_CHECK(validate(input));
-        const graph_shape shape{input.size, input.length, input.options,
-                                numerics<M>::mixed && std::ranges::any_of(input.lengths, [&](int n) { return n < input.length; })};
-        if (!encoder || encoder->shape != shape) {
-            encoder.reset();
-            LAYA_TRY(graph, network<M>::encoder(backend.get(), encoder_memory.get(), w, model.arch, shape, !trace_directory.empty()));
-            encoder.emplace(std::move(*graph));
-        }
-        if (!head || head->batch != input.size) {
-            head.reset();
-            LAYA_TRY(graph, network<M>::actions(backend.get(), head_memory.get(), w, model.arch, input.size));
-            head.emplace(std::move(*graph));
-        }
+        LAYA_CHECK(compile<M>(encoder, {input.size, input.length, input.options,
+                                        numerics<M>::mixed && std::ranges::any_of(input.lengths, [&](int n) { return n < input.length; })},
+                              encoder_memory.get()));
+        LAYA_CHECK(compile<M>(head, input.size, head_memory.get()));
         if constexpr (checked) laya_vk_bf16_status_reset(backend.get());  // synchronizes, so before any copy is queued
         // Inputs and outputs pass through transfer memory: their copies queue with
         // each graph, and the device is awaited once per graph.
@@ -1058,8 +1018,7 @@ struct runtime::impl {
         ggml_backend_synchronize(io.backend);
         if (status != GGML_STATUS_SUCCESS) return fail(errc::backend, "Encoder computation failed");
         raw_result output{{logits.begin(), logits.end()}, {}, model.serving.actions};
-        LAYA_CHECK(check(output.logits));
-        LAYA_CHECK(check(pooled));
+        LAYA_CHECK(check(output.logits, pooled));
         if (!trace_directory.empty()) write_traces();
 
         const auto features = io.take<float>(head->input);
@@ -1077,8 +1036,9 @@ struct runtime::impl {
 };
 
 result<runtime> runtime::load(const std::filesystem::path& directory, mode requested) {
-    if (has(requested, feature::coreml) && !(built & feature::coreml))
-        return fail(errc::unsupported, "This build has no Core ML backend; rebuild with -DLAYA_COREML=ON on macOS arm64");
+    if (const mode missing = requested & (feature::cuda | feature::vulkan | feature::coreml) & ~built)
+        return fail(errc::unsupported, std::string("This build has no ") + (missing == feature::cuda ? "CUDA backend" : missing == feature::vulkan
+                                       ? "Vulkan backend" : "Core ML backend; rebuild with -DLAYA_COREML=ON on macOS arm64"));
     if (const char* reason = rejection(requested)) return fail(errc::unsupported, reason);
     LAYA_TRY(model, checkpoint::load(directory));
     runtime loaded;
