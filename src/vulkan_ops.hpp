@@ -10,11 +10,11 @@ namespace laya::vulkan_precision {
 // op_params[0] carries the operator flags and op_params[1] the operator, which
 // the name confirms once, when the backend admits the node.
 enum class op { pad16, finish, split, merge, pack_qkv, serial, reduce, mlp_bf16, mlp_f16, gelu_bf16, gelu_f16, norm, mask, heads,
-                local_attention, none };
+                local_attention, global_attention, none };
 inline constexpr const char* op_names[]={"laya.pad16-vulkan","laya.finish-projection-vulkan","laya.split-vulkan",
     "laya.merge-vulkan","laya.pack-qkv-vulkan","laya.serial-vulkan","laya.reduce-vulkan","laya.mlp-bf16-vulkan",
     "laya.mlp-f16-vulkan","laya.gelu-bf16-vulkan","laya.gelu-f16-vulkan","laya.norm-vulkan","laya.mask-vulkan",
-    "laya.merge-heads-vulkan","laya.local-attention-vulkan"};
+    "laya.merge-heads-vulkan","laya.local-attention-vulkan","laya.global-attention-vulkan"};
 static_assert(std::size(op_names)==std::size_t(op::none));
 inline op kind(const ggml_tensor* t) {
     const auto k=uint32_t(t->op_params[1]);
@@ -102,20 +102,31 @@ inline ggml_tensor* norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight,
                          ggml_type stored_type=GGML_TYPE_F32) {
     return custom(ctx,op::norm,GGML_TYPE_F32,{x->ne[0],x->ne[1],x->ne[2],x->ne[3]},{x,weight,bias},storage(stored_type));
 }
-// Sliding-window attention as one pass per 32 queries of a head of a
-// sequence: Q and K scaled and V transposed by the pack, keys valid by the
-// lengths, every value rounded as the separate AMD-matched score, softmax and
-// value products round it with the local mask (local_attention.comp). Lanes
-// stay within the matched softmax's 1024 keys; the pass stages 160 keys and
+// Attention as one pass per 32 queries of a head of a sequence: Q and K scaled
+// and V transposed by the pack, keys valid by the lengths, every value rounded
+// as the separate AMD-matched score, softmax and value products round it.
+// Lanes stay within the matched softmax's 1024 keys.
+inline constexpr int64_t attention_pass_keys=1024;
+inline ggml_tensor* attention_pass(ggml_context* ctx, op kind, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* lengths) {
+    if (q->ne[0]!=64 || !ggml_are_same_shape(q,k) || v->ne[0]!=q->ne[1] || v->ne[1]!=64 || v->ne[2]!=q->ne[2] ||
+        v->ne[3]!=q->ne[3] || lengths->type!=GGML_TYPE_I32 || ggml_nelements(lengths)!=q->ne[3] || q->ne[1]>attention_pass_keys)
+        GGML_ABORT("Invalid Vulkan attention pass geometry");
+    return custom(ctx,kind,GGML_TYPE_F32,{64,q->ne[1],q->ne[2],q->ne[3]},{q,k,v,lengths});
+}
+// The sliding window (local mask, local_attention.comp) stages 160 keys and
 // values of 64 dimensions, the probabilities of 32 queries and the per-slot
 // softmax partials in workgroup memory.
-inline constexpr int64_t local_attention_keys=1024;
 inline constexpr uint32_t local_attention_shared=160*17*16+(32*129+3)/4*16+32*33*4+32*4;
 inline ggml_tensor* local_attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* lengths) {
-    if (q->ne[0]!=64 || !ggml_are_same_shape(q,k) || v->ne[0]!=q->ne[1] || v->ne[1]!=64 || v->ne[2]!=q->ne[2] ||
-        v->ne[3]!=q->ne[3] || lengths->type!=GGML_TYPE_I32 || ggml_nelements(lengths)!=q->ne[3] || q->ne[1]>local_attention_keys)
-        GGML_ABORT("Invalid Vulkan local attention geometry");
-    return custom(ctx,op::local_attention,GGML_TYPE_F32,{64,q->ne[1],q->ne[2],q->ne[3]},{q,k,v,lengths});
+    return attention_pass(ctx,op::local_attention,q,k,v,lengths);
+}
+// Global attention (global mask, global_attention.comp) holds its scores in
+// registers and stages the queries, then 64 keys or values with their
+// probabilities at a time. Its pipelines hold 8, 16 or 32 keys per softmax
+// slot, for lanes of up to 256, 512 or 1024 keys.
+inline constexpr uint32_t global_attention_shared=1792*16;
+inline ggml_tensor* global_attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* lengths) {
+    return attention_pass(ctx,op::global_attention,q,k,v,lengths);
 }
 // 0 where a query may attend a key and -inf elsewhere, from the valid length of
 // each sequence. Local masks open keys within 64 positions, and the first key for

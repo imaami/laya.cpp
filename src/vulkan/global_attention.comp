@@ -1,0 +1,212 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// Global attention for 32 consecutive queries of one head of one sequence.
+// Every query, padded or not, attends the sequence's valid keys (mask.comp,
+// global). Every value rounds as in the separate AMD-matched products: score
+// FMAs in dimension order, softmax_amd.comp's slot sums and reduction tree,
+// and the probability/value key order of laya_amd_attention (natural, or from
+// key 64 for the upper 32 dimensions once 128 keys fill its blocks). Keys past
+// the valid length have probability zero; beyond the group of four holding the
+// last valid key they are skipped.
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+layout(binding=0) readonly buffer Query { vec4 query[]; };   // [dimension, token, head, sequence]
+layout(binding=1) readonly buffer Key { vec4 key[]; };       // [dimension, token, head, sequence]
+layout(binding=2) readonly buffer Value { float value[]; };  // [token, dimension, head, sequence]
+layout(binding=3) readonly buffer Lengths { int lengths[]; };
+layout(binding=4) writeonly buffer Output { vec4 y[]; };     // [dimension, token, head, sequence]
+layout(push_constant) uniform Params { uint keys,unused0,unused1,unused2; } p;
+#include "rocm_math.glsl"
+
+// Keys of each softmax slot (key mod 32) an invocation scores: lanes of up to
+// 32*SLOT_KEYS tokens. Keys are staged 64 at a time.
+#ifndef SLOT_KEYS
+#define SLOT_KEYS 32
+#endif
+const uint QUERIES=32u,CHUNK=64u,CHUNKS=SLOT_KEYS/2u;
+
+// Workgroup memory, reused by phase. Scores: the queries, then a chunk of
+// keys. Softmax: per-slot maxima, then sums, 36 floats per query. Values: a
+// chunk's probabilities, 68 floats per query, and values; then the
+// probabilities, 12 floats per query, and values of the eight keys that follow
+// laya_amd_attention's full blocks. Staged keys and values are swizzled
+// against bank conflicts.
+const uint QUERY_AT=0u,KEY_AT=512u;
+const uint MAXIMA_AT=0u,SUMS_AT=288u,PARTIALS=9u;
+const uint WEIGHT_AT=0u,WEIGHTS=17u,VALUE_AT=640u;
+const uint TAIL_WEIGHT_AT=544u,TAIL_WEIGHTS=3u,TAIL_VALUE_AT=1664u;
+shared vec4 lds[1792];
+
+uint swizzled(uint row,uint column) { return row*16u+(column^(row&15u)); }
+
+// Keys [from,to) of the chunk staged from key base, in groups of four.
+void weigh(uint base,uint from,uint to,uint pair,uint column,inout vec4 low,inout vec4 high) {
+    for (uint k=from;k<to;k+=4u) {
+        const uint row=k-base;
+        const vec4 a=lds[WEIGHT_AT+pair*WEIGHTS+row/4u],b=lds[WEIGHT_AT+(pair+16u)*WEIGHTS+row/4u];
+        vec4 v[4];
+        [[unroll]] for (uint i=0u;i<4u;++i) v[i]=lds[VALUE_AT+swizzled(row+i,column)];
+        low=fma(v[0],vec4(a.x),low);
+        low=fma(v[1],vec4(a.y),low);
+        low=fma(v[2],vec4(a.z),low);
+        low=fma(v[3],vec4(a.w),low);
+        high=fma(v[0],vec4(b.x),high);
+        high=fma(v[1],vec4(b.y),high);
+        high=fma(v[2],vec4(b.z),high);
+        high=fma(v[3],vec4(b.w),high);
+    }
+}
+
+// The tail's keys [full,to).
+void weigh_tail(uint full,uint to,uint pair,uint column,inout vec4 low,inout vec4 high) {
+    for (uint k=full;k<to;k+=4u) {
+        const uint row=k-full;
+        const vec4 a=lds[TAIL_WEIGHT_AT+pair*TAIL_WEIGHTS+row/4u],b=lds[TAIL_WEIGHT_AT+(pair+16u)*TAIL_WEIGHTS+row/4u];
+        vec4 v[4];
+        [[unroll]] for (uint i=0u;i<4u;++i) v[i]=lds[TAIL_VALUE_AT+(row+i)*16u+column];
+        low=fma(v[0],vec4(a.x),low);
+        low=fma(v[1],vec4(a.y),low);
+        low=fma(v[2],vec4(a.z),low);
+        low=fma(v[3],vec4(a.w),low);
+        high=fma(v[0],vec4(b.x),high);
+        high=fma(v[1],vec4(b.y),high);
+        high=fma(v[2],vec4(b.z),high);
+        high=fma(v[3],vec4(b.w),high);
+    }
+}
+
+void main() {
+    const uint tid=gl_LocalInvocationID.x,keys=p.keys,first=gl_WorkGroupID.x*QUERIES;
+    const uint head=gl_WorkGroupID.z*gl_NumWorkGroups.y+gl_WorkGroupID.y;  // head of a sequence
+    const uint open=uint(clamp(lengths[gl_WorkGroupID.z],0,int(keys)));    // attended keys
+    const uint weighed=(open+3u)/4u*4u;                                     // keys the values weigh
+    const uint chunks=(open+CHUNK-1u)/CHUNK;
+    for (uint i=tid;i<QUERIES*16u;i+=256u) {
+        const uint q=first+i/16u;
+        lds[QUERY_AT+i]=q<keys ? query[(head*keys+q)*16u+i%16u] : vec4(0.0);
+    }
+
+    // Invocation (group, slot) scores queries group+8a against the keys whose
+    // softmax slot is its own: slot+32j.
+    const uint group=tid/32u,slot=tid%32u;
+    float score[4][SLOT_KEYS];
+    [[unroll]] for (uint a=0u;a<4u;++a)
+        [[unroll]] for (uint j=0u;j<SLOT_KEYS;++j) score[a][j]=0.0;
+    [[unroll]] for (uint c=0u;c<CHUNKS;++c) {
+        if (c<chunks) {
+            barrier();
+            for (uint i=tid;i<CHUNK*16u;i+=256u) {
+                const uint row=i/16u,k=CHUNK*c+row;
+                lds[KEY_AT+swizzled(row,i%16u)]=k<open ? key[(head*keys+k)*16u+i%16u] : vec4(0.0);
+            }
+            barrier();
+            for (uint d=0u;d<16u;++d) {
+                vec4 q4[4];
+                [[unroll]] for (uint a=0u;a<4u;++a) q4[a]=lds[QUERY_AT+(group+8u*a)*16u+d];
+                [[unroll]] for (uint e=0u;e<2u;++e) {
+                    const vec4 k4=lds[KEY_AT+swizzled(slot+32u*e,d)];
+                    [[unroll]] for (uint a=0u;a<4u;++a)
+                        score[a][2u*c+e]=fma(k4.w,q4[a].w,fma(k4.z,q4[a].z,fma(k4.y,q4[a].y,fma(k4.x,q4[a].x,score[a][2u*c+e]))));
+                }
+            }
+        }
+    }
+    barrier();
+
+    [[unroll]] for (uint a=0u;a<4u;++a) {
+        float peak=uintBitsToFloat(0xff800000u);
+        [[unroll]] for (uint j=0u;j<SLOT_KEYS;++j)
+            if (slot+32u*j<open) peak=max(peak,score[a][j]);
+        lds[MAXIMA_AT+(group+8u*a)*PARTIALS+slot/4u][slot%4u]=peak;
+    }
+    barrier();
+    [[unroll]] for (uint a=0u;a<4u;++a) {
+        float peak=uintBitsToFloat(0xff800000u);
+        [[unroll]] for (uint s=0u;s<8u;++s) {
+            const vec4 m=lds[MAXIMA_AT+(group+8u*a)*PARTIALS+s];
+            peak=max(peak,max(max(m.x,m.y),max(m.z,m.w)));
+        }
+        float sum=0.0;
+        [[unroll]] for (uint j=0u;j<SLOT_KEYS;++j)
+            if (slot+32u*j<open) {
+                score[a][j]=rocmExp(score[a][j]-peak);
+                sum+=score[a][j];
+            }
+        lds[SUMS_AT+(group+8u*a)*PARTIALS+slot/4u][slot%4u]=sum;
+    }
+    barrier();
+    [[unroll]] for (uint a=0u;a<4u;++a) {
+        float sums[32];
+        [[unroll]] for (uint s=0u;s<8u;++s) {
+            const vec4 m=lds[SUMS_AT+(group+8u*a)*PARTIALS+s];
+            sums[4u*s]=m.x;
+            sums[4u*s+1u]=m.y;
+            sums[4u*s+2u]=m.z;
+            sums[4u*s+3u]=m.w;
+        }
+        [[unroll]] for (uint width=16u;width>0u;width>>=1u)
+            [[unroll]] for (uint s=0u;s<width;++s) sums[s]+=sums[s+width];
+        [[unroll]] for (uint j=0u;j<SLOT_KEYS;++j)
+            if (slot+32u*j<open) score[a][j]=rocmDivide(score[a][j],sums[0]);
+            else score[a][j]=0.0;
+    }
+
+    // Invocation (column, pair) weighs the values of dimensions 4column..4column+3
+    // for queries pair and pair+16. The upper 32 dimensions of a lane whose
+    // full blocks hold at least 128 keys weigh keys [64,full), [0,64), then
+    // the tail [full,keys); every other dimension weighs them in order.
+    const uint pair=tid%16u,column=tid/16u;
+    const uint full=keys/8u*8u,tail=full/CHUNK;
+    const bool staggered=full>=128u,upper=staggered && column>=8u;
+    vec4 low=vec4(0.0),high=vec4(0.0);
+    [[unroll]] for (uint c=0u;c<CHUNKS;++c) {
+        if (c<chunks) {
+            barrier();
+            [[unroll]] for (uint a=0u;a<4u;++a)
+                [[unroll]] for (uint e=0u;e<2u;++e) {
+                    const uint row=slot+32u*e,k=CHUNK*c+row;
+                    lds[WEIGHT_AT+(group+8u*a)*WEIGHTS+row/4u][row%4u]=score[a][2u*c+e];
+                    if (staggered && c==tail && k>=full && k<full+8u)
+                        lds[TAIL_WEIGHT_AT+(group+8u*a)*TAIL_WEIGHTS+(k-full)/4u][(k-full)%4u]=score[a][2u*c+e];
+                }
+            for (uint i=tid;i<CHUNK*16u;i+=256u) {
+                const uint row=i%CHUNK,d4=i/CHUNK,k=CHUNK*c+row;
+                vec4 v=vec4(0.0);
+                if (k<min(weighed,keys)) {
+                    const uint at=(head*64u+4u*d4)*keys+k;
+                    v=vec4(value[at],value[at+keys],value[at+2u*keys],value[at+3u*keys]);
+                }
+                lds[VALUE_AT+swizzled(row,d4)]=v;
+                if (staggered && c==tail && k>=full && k<full+8u) lds[TAIL_VALUE_AT+(k-full)*16u+d4]=v;
+            }
+            barrier();
+            const uint from=CHUNK*c,to=min(from+CHUNK,weighed);
+            weigh(from,from,!upper ? to : c>0u ? min(to,full) : from,pair,column,low,high);
+        }
+    }
+    if (staggered) {
+        barrier();
+        [[unroll]] for (uint a=0u;a<4u;++a)
+            [[unroll]] for (uint e=0u;e<2u;++e) {
+                const uint row=slot+32u*e;
+                lds[WEIGHT_AT+(group+8u*a)*WEIGHTS+row/4u][row%4u]=score[a][e];
+            }
+        for (uint i=tid;i<CHUNK*16u;i+=256u) {
+            const uint row=i%CHUNK,d4=i/CHUNK;
+            vec4 v=vec4(0.0);
+            if (row<min(weighed,keys)) {
+                const uint at=(head*64u+4u*d4)*keys+row;
+                v=vec4(value[at],value[at+keys],value[at+2u*keys],value[at+3u*keys]);
+            }
+            lds[VALUE_AT+swizzled(row,d4)]=v;
+        }
+        barrier();
+        if (upper) {
+            weigh(0u,0u,min(CHUNK,weighed),pair,column,low,high);
+            weigh_tail(full,weighed,pair,column,low,high);
+        }
+    }
+
+    const uint q=first+pair;
+    if (q<keys) y[(head*keys+q)*16u+column]=low;
+    if (q+16u<keys) y[(head*keys+q+16u)*16u+column]=high;
+}

@@ -299,28 +299,20 @@ tensor* fused_attention(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tens
 }
 
 // Scores and probabilities as separate products, per head:
-// [dimension, token, head, sequence]. AMD-matched numerics scale both factors
-// by 8^-1/2 before the product, as the ROCm reference does. A Vulkan pack can
-// provide Q and K already scaled, and V transposed (vulkan_precision::packing).
-template<bool Amd, int Packing = vulkan_precision::packed_plain>
+// [dimension, token, head, sequence]. A Vulkan pack can provide V transposed
+// (vulkan_precision::packing).
+template<int Packing = vulkan_precision::packed_plain>
 tensor* attention_products(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask) {
-    if constexpr (Amd && !(Packing & vulkan_precision::packed_scaled_qk))
-        q = ggml_scale(ctx, q, vulkan_precision::qk_scale), k = ggml_scale(ctx, k, vulkan_precision::qk_scale);
     auto* scores = ggml_mul_mat(ctx, k, q);
     ggml_prec_set_acc(scores, GGML_PREC_F32);
-    auto* probabilities = ggml_soft_max_ext(ctx, scores, mask, Amd ? 1.0f : 1.0f / 8.0f, 0);
+    auto* probabilities = ggml_soft_max_ext(ctx, scores, mask, 1.0f / 8.0f, 0);
     if constexpr (!(Packing & vulkan_precision::packed_transposed_v)) v = ggml_cont(ctx, ggml_transpose(ctx, v));
     auto* value = ggml_mul_mat(ctx, v, probabilities);
     ggml_prec_set_acc(value, GGML_PREC_F32);
-    if constexpr (Amd) {
-        ggml_set_name(scores, "laya.amd-low-qk");
-        ggml_set_name(probabilities, "laya.amd-low-softmax");
-        ggml_set_name(value, "laya.amd-low-pv");
-    }
     return value;
 }
 tensor* explicit_attention(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
-    auto* value = attention_products<false>(ctx, q, k, v, mask);
+    auto* value = attention_products(ctx, q, k, v, mask);
     return ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, value, 0, 2, 1, 3)), at.width, at.tokens());
 }
 
@@ -486,9 +478,14 @@ struct numerics<M> {
             return wide{fused_attention(ctx, q, k, v, mask, mask ? at.masked_kernel() : "laya.sdpa-flash", at)};
         } else {
             // Heads merge into token rows stored as the output projection reads them.
-            // AMD-matched sliding windows run as one pass with the same roundings.
-            auto* value = amd && !at.head && !at.global ? vulkan_precision::local_attention(ctx, q, k, v, at.lengths)
-                                                        : attention_products<amd, packing>(ctx, q, k, v, mask);
+            // AMD-matched attention runs as one pass, rounding as the separate
+            // ROCm products do; its kernels apply the masks themselves.
+            tensor* value;
+            if constexpr (amd)
+                value = at.head || at.global ? vulkan_precision::global_attention(ctx, q, k, v, at.lengths)
+                                             : vulkan_precision::local_attention(ctx, q, k, v, at.lengths);
+            else
+                value = attention_products<packing>(ctx, q, k, v, mask);
             return operand<true>{vulkan_precision::merge_heads(ctx, value, low)};
         }
     }

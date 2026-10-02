@@ -87,16 +87,28 @@ Vulkan.
 
 The 16-bit fused attention kernels retain FP32 output accumulation. Operator
 tests cover unaligned key lengths, uniform attention, nonuniform masked
-attention and empty masked rows on both tested GPUs. The NVIDIA 16-bit profile uses fused attention. The validated AMD FP16 path
-uses separate QK, softmax and probability/value kernels with measured rounding
-orders.
+attention and empty masked rows on both tested GPUs. The NVIDIA 16-bit profile uses fused attention. The validated AMD 16-bit path
+rounds as separate QK, softmax and probability/value kernels with measured
+rounding orders do (tagged `laya.amd-low-qk`, `-softmax` and `-pv`), but
+computes all three in one pass per block of 32 queries of a head:
+`local_attention.comp` for sliding-window layers and `global_attention.comp`
+for global and decision-head layers. Each pass applies its mask from the
+sequence lengths and skips keys whose probability is zero. The sliding-window
+pass needs 64,384 bytes of workgroup memory and the global pass 28,672; global
+attention keeps its scores in registers, with pipelines for lanes of up to 256,
+512 and 1,024 keys. The `vulkan-fused-attention` test requires the bits of the
+separate tagged products on AMD, apart from the sign of a zero. On every device
+it checks both passes against a double-precision reference, and checks the
+probability/value key order exactly with uniform probabilities and
+power-of-two values.
 
-When 16-bit attention runs as separate products, the Q/K/V pack also writes V
-transposed for the probability/value product. On AMD it writes Q and K already
-scaled by 8^-1/2, with the rounding `ggml_scale` applies. A single pass then
-merges the heads into token rows rounded for the output projection, replacing
-the separate scale, transpose, permute and rounding passes. Operator tests check
-that this produces the same attention output bits as the separate passes.
+When 16-bit attention runs as separate products or AMD passes, the Q/K/V pack
+also writes V transposed for the probability/value product. On AMD it writes Q
+and K already scaled by 8^-1/2, with the rounding `ggml_scale` applies. A single
+pass then merges the heads into token rows rounded for the output projection,
+replacing the separate scale, transpose, permute and rounding passes. Operator
+tests check that this produces the same attention output bits as the separate
+passes.
 `GGML_VK_PERF_LOGGER=1` reports Laya operators by name, and every operator with
 its output shape.
 
@@ -253,9 +265,9 @@ See the production validation records for [FP16](measurements/vulkan-amd-fp16-ru
 and [BF16](measurements/vulkan-amd-bf16-runtime-validation.json).
 Use `--vulkan --fp16` or `--vulkan --bf16` after selecting the AMD device.
 
-The AMD path uses separate tagged projection, attention and softmax pipelines.
-Its reduction and rounding rules are measured for the recorded GPU and ROCm
-version. [Paired AMD FP16 timings](vulkan-amd-16bit-performance.md) and
+The AMD path uses tagged projection pipelines, and attention passes that round
+as its tagged attention and softmax pipelines do. Its reduction and rounding
+rules are measured for the recorded GPU and ROCm version. [Paired AMD FP16 timings](vulkan-amd-16bit-performance.md) and
 [optimized BF16 timings](vulkan-amd-bf16-parallel-scan-performance.md)
 cover all three models at batches 1/2/4/8. FP16 reaches 72–125% of Python
 throughput; optimized BF16 reaches 49–92%. All answer checks pass. The subgroup

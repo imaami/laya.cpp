@@ -49,6 +49,19 @@ FP32 and BF16 do not, by themselves, indicate a porting bug. The objective is to
 preserve the model's behavior at the selected precision, not to require every
 mode to reproduce higher-precision arithmetic.
 
+Without the PyTorch baseline, two native builds can be compared for identical
+raw outputs on the same machine, model, backend and precision. JSON numbers
+round-trip, so equal text means equal bits; lanes and timings are excluded:
+
+```sh
+laya-cli --model DIR --vulkan --fp16 --raw --input requests.json | jq -c 'del(.lanes, .compute_ms)' > before.jsonl
+# rebuild, then:
+laya-cli --model DIR --vulkan --fp16 --raw --input requests.json | jq -c 'del(.lanes, .compute_ms)' | cmp - before.jsonl
+```
+
+This detects any change in rounding between builds. It is not acceptance
+evidence: it says nothing about agreement with the baseline.
+
 Tokenizer tests additionally cover 253 fixtures including added tokens,
 whitespace, combining characters, multiple scripts, emoji, and control characters.
 They run through CTest when the local tokenizer model is present.

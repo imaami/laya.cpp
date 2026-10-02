@@ -1,5 +1,11 @@
 // Included inside the generated ggml Vulkan translation unit (C++17).
 #include "vulkan_ops.hpp"
+// The attention pass pipeline for a lane of the given length.
+template<class Device> static auto& laya_vk_attention(Device& device, laya::vulkan_precision::op kind, int64_t tokens) {
+    return kind==laya::vulkan_precision::op::local_attention ? device.pipeline_laya_local_attention
+        : tokens<=256 ? device.pipeline_laya_global_attention_256
+        : tokens<=512 ? device.pipeline_laya_global_attention_512 : device.pipeline_laya_global_attention_1024;
+}
 static bool laya_vk_supports(const ggml_tensor* op, const vk_device_struct& device) {
     using K=laya::vulkan_precision::op;
     const auto kind=laya::vulkan_precision::kind(op);
@@ -40,12 +46,12 @@ static bool laya_vk_supports(const ggml_tensor* op, const vk_device_struct& devi
     case K::heads:
         return f32(x) && f32(op) && x->ne[0]==64 && op->ne[0]==64*x->ne[2] && op->ne[1]==x->ne[1]*x->ne[3] &&
             op->ne[2]==1 && op->ne[3]==1 && flags<3 && indexable;
-    case K::local_attention: {
+    case K::local_attention: case K::global_attention: {
         const ggml_tensor* lengths=op->src[3];
-        return device.pipeline_laya_local_attention && f32(x) && f32(b) && f32(r) && f32(op) && lengths &&
+        return laya_vk_attention(device,kind,x->ne[1]) && f32(x) && f32(b) && f32(r) && f32(op) && lengths &&
             lengths->type==GGML_TYPE_I32 && ggml_is_contiguous(lengths) && x->ne[0]==64 && ggml_are_same_shape(x,b) &&
             ggml_are_same_shape(x,op) && r->ne[0]==x->ne[1] && r->ne[1]==64 && r->ne[2]==x->ne[2] && r->ne[3]==x->ne[3] &&
-            ggml_nelements(lengths)==x->ne[3] && x->ne[1]<=laya::vulkan_precision::local_attention_keys &&
+            ggml_nelements(lengths)==x->ne[3] && x->ne[1]<=laya::vulkan_precision::attention_pass_keys &&
             x->ne[2]<=65535 && x->ne[3]<=65535;
     }
     case K::none: break;
@@ -88,10 +94,10 @@ static void laya_vk_custom(ggml_backend_vk_context* ctx, vk_context& subctx, ggm
     case K::mask:
         return run(device.pipeline_laya_mask,{uint32_t(op->ne[0]),uint32_t(op->ne[1]),flags|(op->type==GGML_TYPE_F16 ? 2u : 0u),0},
             {uint32_t(op->ne[0]),uint32_t(op->ne[1]),uint32_t(op->ne[3])},x,op);
-    case K::local_attention: {
+    case K::local_attention: case K::global_attention: {
         // One workgroup per block of 32 queries of a head of a sequence.
         const uint32_t tokens=uint32_t(op->ne[1]),heads=uint32_t(op->ne[2]),batches=uint32_t(op->ne[3]);
-        return run(device.pipeline_laya_local_attention,{tokens,0,0,0},{(tokens+31)/32*256,heads,batches},x,b,r,op->src[3],op);
+        return run(laya_vk_attention(device,kind,tokens),{tokens,0,0,0},{(tokens+31)/32*256,heads,batches},x,b,r,op->src[3],op);
     }
     case K::none: GGML_ABORT("Unsupported Laya Vulkan operator");
     default:
