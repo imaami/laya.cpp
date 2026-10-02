@@ -6,32 +6,56 @@ layout(binding=2) readonly buffer Sine { float sine[]; };
 layout(binding=3) writeonly buffer Output { float y[]; };
 layout(push_constant) uniform Params { uint tokens,heads,batches,flags; } p;
 #include "rounding.glsl"
+// Flags: 1-2 storage precision, 4 rotary positions, 8 Q and K scaled by
+// 8^-1/2 as ggml_scale computes it, 16 V stored transposed.
+const uint block=32;
+shared float tile[block*65];
 float roundOutput(float value) {
     uint format_code=p.flags&3;
     if (format_code==0) return value;
     if (format_code==1) return unpackHalf2x16(halfBits(value)).x;
     uint bits=floatBitsToUint(value);
-    if ((bits&0x7fffffff)>0x7f800000) return uintBitsToFloat(bits|0x00400000);
+    if ((bits & 0x7fffffff)>0x7f800000) return uintBitsToFloat(bits|0x00400000);
     return uintBitsToFloat((bits+0x7fff+((bits>>16)&1))&0xffff0000);
 }
+// A workgroup packs one block of tokens of one head: x is the token block,
+// y the head and z the sequence. Each invocation keeps one dimension and
+// steps through every fourth token, so reads and writes stay row-contiguous;
+// a transposed V passes through shared memory.
 void main() {
-    uint index=gl_GlobalInvocationID.x;
-    uint count=64*p.tokens*p.heads*p.batches;
-    if (index>=count*3) return;
-    uint component=index/count;
-    uint d=index%64,token=(index/64)%p.tokens,head=(index/(64*p.tokens))%p.heads;
-    uint batch=(index/(64*p.tokens*p.heads))%p.batches;
-    uint width=64*p.heads;
-    uint source=(batch*p.tokens+token)*3*width+component*width+head*64+d;
-    // Projections pass unrounded products; storage rounding happens on read.
-    float value=roundOutput(x[source]);
-    if ((p.flags&4)!=0 && component<2) {
-        uint opposite=d<32 ? source+32 : source-32;
-        float rotated=d<32 ? -roundOutput(x[opposite]) : roundOutput(x[opposite]);
-        precise float first=value*cosine[token*64+d];
-        precise float second=rotated*sine[token*64+d];
-        precise float sum=first+second;
-        value=sum;
+    const uint tid=gl_LocalInvocationID.x, d=tid%64, head=gl_WorkGroupID.y, first=gl_WorkGroupID.x*block;
+    const uint width=64*p.heads, plane=64*p.tokens;
+    const bool rotary=(p.flags&4)!=0, scaled=(p.flags&8)!=0, transposed=(p.flags&16)!=0;
+    const float qkScale=uintBitsToFloat(0x3eb504f3u);  // sqrt(1/8) in single precision
+    for (uint batch=gl_WorkGroupID.z;batch<p.batches;batch+=gl_NumWorkGroups.z) {
+        for (uint component=0;component<3;++component) {
+            const uint target=((component*p.batches+batch)*p.heads+head)*plane;
+            for (uint i=tid/64;i<block && first+i<p.tokens;i+=4) {
+                const uint token=first+i;
+                const uint source=(batch*p.tokens+token)*3*width+component*width+head*64+d;
+                // Projections pass unrounded products; storage rounding happens on read.
+                float value=roundOutput(x[source]);
+                if (rotary && component<2) {
+                    uint opposite=d<32 ? source+32 : source-32;
+                    float rotated=d<32 ? -roundOutput(x[opposite]) : roundOutput(x[opposite]);
+                    precise float first_term=value*cosine[token*64+d];
+                    precise float second=rotated*sine[token*64+d];
+                    precise float sum=first_term+second;
+                    value=sum;
+                }
+                value=roundOutput(value);
+                if (scaled && component<2) value=value*qkScale+0.0;
+                if (transposed && component==2) tile[i*65+d]=value;
+                else y[target+token*64+d]=value;
+            }
+        }
+        if (transposed) {
+            barrier();
+            const uint target=((2*p.batches+batch)*p.heads+head)*plane, i=tid%block, token=first+i;
+            if (token<p.tokens)
+                for (uint dimension=tid/block;dimension<64;dimension+=256/block)
+                    y[target+dimension*p.tokens+token]=tile[i*65+dimension];
+            barrier();
+        }
     }
-    y[index]=roundOutput(value);
 }

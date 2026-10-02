@@ -31,20 +31,23 @@ float tinyBfloatProduct(float a,float b) {
     if (mantissa==256) { mantissa=128; unbiased+=1; }
     return uintBitsToFloat(sign|(uint(unbiased+127)<<23)|((mantissa&127)<<16));
 }
+// x is the output column and y steps through the rows.
 void main() {
-    uint i=gl_GlobalInvocationID.x;
-    if (i>=p.width*p.rows) return;
-    uint source=(i/p.width)*p.width*(1+p.gated)+i%p.width;
-    // Inputs are rounded to storage precision on read, so a projection can
-    // pass its product without a separate rounding pass.
-    float v=rounded(x[source]);
-    uint index=p.bf16!=0 ? floatBitsToUint(v)>>16 : halfBits(v);
-    float value=table[index];
-    if (p.gated!=0) {
-        float gate=rounded(x[source+p.width]);
-        uint a=(floatBitsToUint(value)>>23)&255, b=(floatBitsToUint(gate)>>23)&255;
-        value=p.bf16!=0 && a!=255 && b!=255 && (a==0 || b==0 || a+b<=128)
-            ? tinyBfloatProduct(value,gate) : rounded(value*gate);
+    const uint column=gl_GlobalInvocationID.x;
+    if (column>=p.width) return;
+    for (uint row=gl_WorkGroupID.y;row<p.rows;row+=gl_NumWorkGroups.y) {
+        const uint source=row*p.width*(1+p.gated)+column;
+        // Inputs are rounded to storage precision on read, so a projection can
+        // pass its product without a separate rounding pass.
+        float v=rounded(x[source]);
+        uint index=p.bf16!=0 ? floatBitsToUint(v)>>16 : halfBits(v);
+        float value=table[index];
+        if (p.gated!=0) {
+            float gate=rounded(x[source+p.width]);
+            uint a=(floatBitsToUint(value)>>23)&255, b=(floatBitsToUint(gate)>>23)&255;
+            value=p.bf16!=0 && a!=255 && b!=255 && (a==0 || b==0 || a+b<=128)
+                ? tinyBfloatProduct(value,gate) : rounded(value*gate);
+        }
+        y[row*p.width+column]=value;
     }
-    y[i]=value;
 }

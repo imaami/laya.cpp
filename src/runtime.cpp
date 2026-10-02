@@ -296,26 +296,37 @@ tensor* fused_attention(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tens
     return ggml_reshape_2d(ctx, ggml_is_contiguous(value) ? value : ggml_cont(ctx, value), at.width, at.tokens());
 }
 
-// Scores and probabilities as separate products. AMD-matched numerics scale
-// both factors by 8^-1/2 before the product, as the ROCm reference does.
-template<bool Amd>
-tensor* explicit_attention(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
-    if constexpr (Amd) q = ggml_scale(ctx, q, std::sqrt(1.0f / 8.0f)), k = ggml_scale(ctx, k, std::sqrt(1.0f / 8.0f));
+// Scores and probabilities as separate products, per head:
+// [dimension, token, head, sequence]. AMD-matched numerics scale both factors
+// by 8^-1/2 before the product, as the ROCm reference does. A Vulkan pack can
+// provide Q and K already scaled, and V transposed (vulkan_precision::packing).
+template<bool Amd, int Packing = vulkan_precision::packed_plain>
+tensor* attention_products(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask) {
+    if constexpr (Amd && !(Packing & vulkan_precision::packed_scaled_qk))
+        q = ggml_scale(ctx, q, vulkan_precision::qk_scale), k = ggml_scale(ctx, k, vulkan_precision::qk_scale);
     auto* scores = ggml_mul_mat(ctx, k, q);
     ggml_prec_set_acc(scores, GGML_PREC_F32);
     auto* probabilities = ggml_soft_max_ext(ctx, scores, mask, Amd ? 1.0f : 1.0f / 8.0f, 0);
-    auto* value = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, v)), probabilities);
+    if constexpr (!(Packing & vulkan_precision::packed_transposed_v)) v = ggml_cont(ctx, ggml_transpose(ctx, v));
+    auto* value = ggml_mul_mat(ctx, v, probabilities);
     ggml_prec_set_acc(value, GGML_PREC_F32);
     if constexpr (Amd) {
         ggml_set_name(scores, "laya.amd-low-qk");
         ggml_set_name(probabilities, "laya.amd-low-softmax");
         ggml_set_name(value, "laya.amd-low-pv");
     }
+    return value;
+}
+tensor* explicit_attention(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
+    auto* value = attention_products<false>(ctx, q, k, v, mask);
     return ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, value, 0, 2, 1, 3)), at.width, at.tokens());
 }
 
 // Numerics policies: how each mode rounds, projects, normalizes and attends.
 template<mode M> struct numerics;
+// The operand layout a policy's pack writes: plain unless it declares one.
+template<class N> constexpr int packing_of = vulkan_precision::packed_plain;
+template<class N> requires requires { N::packing; } constexpr int packing_of<N> = N::packing;
 
 // Strict FP32: products accumulate in FP32 from FP32 operands. Compensated
 // modes store trunk matrices in FP16 and split each FP32 operand into a high
@@ -371,10 +382,10 @@ struct numerics<M> {
         else return pack_qkv(ctx, qkv, cosine, sine, length, batch, false);
     }
     static tensor* query(ggml_context*, tensor* q) { return q; }
-    static tensor* attend(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
+    static wide attend(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
         // Fused FP32 attention is exact only while its tiles cover the sequence.
-        if (has(M, feature::flash) && at.length <= 128) return fused_attention(ctx, q, k, v, mask, nullptr, at);
-        return explicit_attention<false>(ctx, q, k, v, mask, at);
+        if (has(M, feature::flash) && at.length <= 128) return {fused_attention(ctx, q, k, v, mask, nullptr, at)};
+        return {explicit_attention(ctx, q, k, v, mask, at)};
     }
     static std::pair<float, float> rotary(int, float inverse, int position, int) {
         const float angle = float(position) * inverse;
@@ -406,8 +417,8 @@ struct numerics<M> {
         return pack_qkv(ctx, qkv, cosine, sine, length, batch, true);
     }
     static tensor* query(ggml_context* ctx, tensor* q) { return ggml_cast(ctx, q, GGML_TYPE_F32); }
-    static tensor* attend(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
-        return fused_attention(ctx, q, k, v, mask, at.masked_kernel(), at);
+    static wide attend(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
+        return {fused_attention(ctx, q, k, v, mask, at.masked_kernel(), at)};
     }
     // The CUDA rotary kernel evaluates the cosine itself from the raw angle.
     static std::pair<float, float> rotary(int, float inverse, int position, int) {
@@ -427,6 +438,11 @@ struct numerics<M> {
     static constexpr storage layout{.trunk = low, .projection = low, .amd_bf16_range = amd && bf16, .gelu_table = true};
     static constexpr bool mixed = true, fused_residual = true, split_mlp = false;
     static constexpr bool transposed_head = amd;  // AMD batched heads project in a sequence-major layout
+    static constexpr bool flash = has(M, feature::flash) && !amd;
+    // Explicit attention reads V transposed, and AMD-matched Q and K scaled,
+    // as the pack writes them; fused attention reads the plain layout.
+    static constexpr int packing = flash ? vulkan_precision::packed_plain
+                                         : vulkan_precision::packed_transposed_v | (amd ? vulkan_precision::packed_scaled_qk : 0);
 
     template<bool Compact> static operand<Compact> norm(ggml_context* ctx, tensor* x, const weights::linear& affine) {
         return {vulkan_precision::norm(ctx, x, affine.weight, affine.bias, Compact ? low : GGML_TYPE_F32)};
@@ -456,18 +472,19 @@ struct numerics<M> {
     }
     static tensor* round(ggml_context* ctx, tensor* x) { return vulkan_precision::round(ctx, x, low); }
     static tensor* pack(ggml_context* ctx, tensor* qkv, tensor* cosine, tensor* sine, int length, int batch) {
-        return vulkan_precision::pack_qkv(ctx, qkv, cosine, sine, length, batch, low);
+        return vulkan_precision::pack_qkv(ctx, qkv, cosine, sine, length, batch, low, packing);
     }
     static tensor* query(ggml_context*, tensor* q) { return q; }  // packed in FP32
-    static tensor* attend(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
-        if constexpr (has(M, feature::flash) && !amd) {
+    static auto attend(ggml_context* ctx, tensor* q, tensor* k, tensor* v, tensor* mask, const attention_site& at) {
+        if constexpr (flash) {
             // Unpadded global (or fully windowed) attention needs no mask.
             if (!at.head && !at.padding && (at.global || at.length < local_window)) mask = nullptr;
             k = ggml_cast(ctx, k, low);
             v = ggml_cast(ctx, v, low);
-            return fused_attention(ctx, q, k, v, mask, mask ? at.masked_kernel() : "laya.sdpa-flash", at);
+            return wide{fused_attention(ctx, q, k, v, mask, mask ? at.masked_kernel() : "laya.sdpa-flash", at)};
         } else {
-            return explicit_attention<amd>(ctx, q, k, v, mask, at);
+            // Heads merge into token rows stored as the output projection reads them.
+            return operand<true>{vulkan_precision::merge_heads(ctx, attention_products<amd, packing>(ctx, q, k, v, mask), low)};
         }
     }
     // Rotary and GELU tables reproduce the rounded values of the matched device library.
@@ -592,18 +609,22 @@ template<mode M> struct network {
         trace<compact>(qkv, scope, layer, ".attn.Wqkv");
         const int kind = at.global ? 0 : 1;
         auto* packed = N::pack(ctx, qkv, Head ? nullptr : g.cosine[kind], Head ? nullptr : g.sine[kind], at.length, at.batch);
-        tensor* split[3];
-        for (int i = 0; i < 3; ++i)
-            split[i] = ggml_view_4d(ctx, packed, 64, at.length, arch.heads, at.batch, packed->nb[1], packed->nb[2], packed->nb[3],
-                                    i * at.batch * packed->nb[3]);
-        auto *q = N::query(ctx, split[0]), *k = split[1];
+        // Q, K and V follow one another, each [dimension, token, head, sequence]
+        // unless the pack transposed V's leading dimensions.
+        const auto part = [&](int i, bool transposed) {
+            const std::int64_t rows = transposed ? 64 : at.length, row = transposed ? at.length : 64;
+            return ggml_view_4d(ctx, packed, row, rows, arch.heads, at.batch, row * ggml_element_size(packed), packed->nb[2],
+                                packed->nb[3], i * at.batch * packed->nb[3]);
+        };
+        auto *q = N::query(ctx, part(0, false)), *k = part(1, false);
         if (traces) {  // traced views are made contiguous
             trace(q = ggml_cont(ctx, q), scope, layer, ".q");
             trace(k = ggml_cont(ctx, k), scope, layer, ".k");
         }
-        auto* value = N::attend(ctx, q, k, split[2], Head || at.global ? g.global_mask : g.local_mask, at);
-        trace(value, scope, layer, ".attn.Wo.input");
-        auto* output = N::template linear<role::trunk>(ctx, wide{value}, p.out, Head ? p.out_bias : nullptr, fused ? h : nullptr).t;
+        constexpr bool transposed_v = (packing_of<N> & vulkan_precision::packed_transposed_v) != 0;
+        auto value = N::attend(ctx, q, k, part(2, transposed_v), Head || at.global ? g.global_mask : g.local_mask, at);
+        trace(value.t, scope, layer, ".attn.Wo.input");
+        auto* output = N::template linear<role::trunk>(ctx, value, p.out, Head ? p.out_bias : nullptr, fused ? h : nullptr).t;
         trace(output, scope, layer, fused ? ".attn.residual" : ".attn.Wo");
         return output;
     }

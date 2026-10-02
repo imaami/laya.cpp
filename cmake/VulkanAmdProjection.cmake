@@ -62,3 +62,8 @@ laya_vk_replace("} else if (ctx->num_additional_fused_ops == 0 &&"
   "} else if (ctx->num_additional_fused_ops == 0 && !(ctx->device->vendor_id==VK_VENDOR_ID_AMD && std::strcmp(dst->name,\"laya.amd-low-projection\")==0) &&")
 laya_vk_replace("} else if (!(ctx->device->coopmat2 && dst->ne[1]>1"
   "} else if (!(ctx->device->vendor_id==VK_VENDOR_ID_AMD && std::strcmp(dst->name,\"laya.amd-low-projection\")==0 && dst->ne[1]>1 && (dst->ne[0]>=64 || dst->ne[0]==1)) && !(ctx->device->coopmat2 && dst->ne[1]>1")
+# Every coopmat1 F16 tile is 16 deep, and aligned vector loads fill the same
+# shared tiles as scalar loads. Keep them for any K that is a multiple of 16,
+# such as the 2624-wide MLP down-projection, not only multiples of 128.
+laya_vk_replace("    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;"
+  "    const bool aligned = !quantize_y && (ne10 == kpad || (ctx->device->vendor_id==VK_VENDOR_ID_AMD && src0->type==GGML_TYPE_F16 && ne10%16==0 && std::strcmp(dst->name,\"laya.amd-low-projection\")==0)) && ne01 > 8 && ne11 > 8;")

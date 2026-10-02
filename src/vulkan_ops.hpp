@@ -3,15 +3,18 @@
 #include <array>
 #include <cstring>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 namespace laya::vulkan_precision {
 // Custom nodes run only by the patched Vulkan backend (vulkan_dispatch.hpp):
 // op_params[0] carries the operator flags and op_params[1] the operator, which
 // the name confirms once, when the backend admits the node.
-enum class op { pad16, finish, split, merge, pack_qkv, serial, reduce, mlp_bf16, mlp_f16, gelu_bf16, gelu_f16, norm, mask, none };
+enum class op { pad16, finish, split, merge, pack_qkv, serial, reduce, mlp_bf16, mlp_f16, gelu_bf16, gelu_f16, norm, mask, heads, none };
 inline constexpr const char* op_names[]={"laya.pad16-vulkan","laya.finish-projection-vulkan","laya.split-vulkan",
     "laya.merge-vulkan","laya.pack-qkv-vulkan","laya.serial-vulkan","laya.reduce-vulkan","laya.mlp-bf16-vulkan",
-    "laya.mlp-f16-vulkan","laya.gelu-bf16-vulkan","laya.gelu-f16-vulkan","laya.norm-vulkan","laya.mask-vulkan"};
+    "laya.mlp-f16-vulkan","laya.gelu-bf16-vulkan","laya.gelu-f16-vulkan","laya.norm-vulkan","laya.mask-vulkan",
+    "laya.merge-heads-vulkan"};
+static_assert(std::size(op_names)==std::size_t(op::none));
 inline op kind(const ggml_tensor* t) {
     const auto k=uint32_t(t->op_params[1]);
     return k<uint32_t(op::none) && !std::strcmp(t->name,op_names[k]) ? op(k) : op::none;
@@ -47,14 +50,26 @@ inline ggml_tensor* finish_projection(ggml_context* ctx, ggml_tensor* x, ggml_te
     return custom(ctx,op::finish,GGML_TYPE_F32,{x->ne[0],x->ne[1],x->ne[2],x->ne[3]},{x,bias ? bias : x,residual ? residual : x},
                   storage(stored_type)|(bias ? 4 : 0)|(residual ? 8 : 0));
 }
+// Operand layouts a QKV pack can write for explicit attention (bit flags).
+// Scaled Q and K are multiplied by 8^-1/2 as ggml_scale does, the order the
+// ROCm reference uses; transposed V is [token, dimension, head, sequence].
+enum packing : int32_t { packed_plain=0, packed_scaled_qk=8, packed_transposed_v=16 };
+inline constexpr float qk_scale=0x1.6a09e6p-2f;  // sqrt(1/8), rounded as in single precision
 // Pack Q/K/V and apply rotary positions in one dispatch, retaining explicit
 // product/addition rounding and the requested projection storage precision.
-inline ggml_tensor* pack_qkv(ggml_context* ctx, ggml_tensor* x, ggml_tensor* cosine,
-                             ggml_tensor* sine, int64_t length, int64_t batches, ggml_type stored_type) {
-    if (length<=0 || batches<=0 || x->ne[0]%192 || x->ne[1]!=length*batches || bool(cosine)!=bool(sine))
+inline ggml_tensor* pack_qkv(ggml_context* ctx, ggml_tensor* x, ggml_tensor* cosine, ggml_tensor* sine,
+                             int64_t length, int64_t batches, ggml_type stored_type, int32_t layout=packed_plain) {
+    if (length<=0 || batches<=0 || x->ne[0]%192 || x->ne[1]!=length*batches || bool(cosine)!=bool(sine) ||
+        (layout & ~(packed_scaled_qk|packed_transposed_v)))
         GGML_ABORT("Invalid Vulkan QKV packing geometry");
     return custom(ctx,op::pack_qkv,GGML_TYPE_F32,{64,length,x->ne[0]/192,3*batches},{x,cosine ? cosine : x,sine ? sine : x},
-                  storage(stored_type)|(cosine ? 4 : 0));
+                  storage(stored_type)|(cosine ? 4 : 0)|layout);
+}
+// Attention output [dimension, token, head, sequence] as one row of
+// [head, dimension] per token, rounded to the projection storage precision.
+inline ggml_tensor* merge_heads(ggml_context* ctx, ggml_tensor* x, ggml_type stored_type) {
+    if (x->type!=GGML_TYPE_F32 || x->ne[0]!=64 || !ggml_is_contiguous(x)) GGML_ABORT("Invalid Vulkan attention output");
+    return custom(ctx,op::heads,GGML_TYPE_F32,{64*x->ne[2],x->ne[1]*x->ne[3],1,1},{x},storage(stored_type));
 }
 // A finite FP16 high part has a rounding residual of at most 16.
 // Scaling by 1024 preserves small corrections without overflowing at large inputs.

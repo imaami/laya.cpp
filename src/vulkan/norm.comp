@@ -30,9 +30,8 @@ vec3 combine(vec3 left,vec3 right) {
     return vec3(fma(a,right.x,b*left.x),fma(delta*delta*right.z,b,right.y+left.y),count);
 #endif
 }
-void main() {
-    uint row=gl_WorkGroupID.x, tid=gl_LocalInvocationID.x;
-    if (row>=p.rows) return;
+void normalizeRow(uint row) {
+    uint tid=gl_LocalInvocationID.x;
     vec3 value=vec3(0.0);
     for (uint base=tid*4; base<p.width; base+=threads*4) {
         for (uint j=0;j<4;++j) {
@@ -63,5 +62,12 @@ void main() {
         float normalized=inverse*(x[row*p.width+i]-mean);
         float value=p.has_bias!=0 ? fma(weight[i],normalized,bias[i]) : weight[i]*normalized;
         y[row*p.width+i]=stored(value);
+    }
+}
+// One workgroup per row; workgroups step through rows beyond the dispatch limit.
+void main() {
+    for (uint row=gl_WorkGroupID.x;row<p.rows;row+=gl_NumWorkGroups.x) {
+        normalizeRow(row);
+        barrier();
     }
 }

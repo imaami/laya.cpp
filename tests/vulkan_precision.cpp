@@ -127,13 +127,18 @@ int main() {
             laya::test::fail("Projection storage changed rounding, signed zero, or residual order");
         ggml_gallocr_free(allocator);ggml_free(ctx);
     }
-    for (ggml_type type : {GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16}) for (bool rotary : {false,true}) {
-        constexpr int length=17,heads=3,batches=2,width=64*heads,count=3*width*length*batches;
+    using laya::vulkan_precision::packed_plain,laya::vulkan_precision::packed_scaled_qk,
+          laya::vulkan_precision::packed_transposed_v,laya::vulkan_precision::qk_scale;
+    for (ggml_type type : {GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16}) for (bool rotary : {false,true})
+    for (int length : {17,70}) for (int32_t layout : std::array<int32_t,4>{packed_plain,packed_scaled_qk,packed_transposed_v,
+                                                                         packed_scaled_qk|packed_transposed_v}) {
+        constexpr int heads=3,batches=2,width=64*heads;
+        const int count=3*width*length*batches;
         auto ctx=ggml_init({16*ggml_tensor_overhead()+ggml_graph_overhead(),nullptr,true});
         auto x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,3*width,length*batches);
         auto c=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,64,length);
         auto sn=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,64,length);
-        auto output=laya::vulkan_precision::pack_qkv(ctx,x,rotary ? c : nullptr,rotary ? sn : nullptr,length,batches,type);
+        auto output=laya::vulkan_precision::pack_qkv(ctx,x,rotary ? c : nullptr,rotary ? sn : nullptr,length,batches,type,layout);
         if (!ggml_backend_supports_op(backend,output)) laya::test::fail("QKV packing unsupported");
         auto graph=ggml_new_graph(ctx);ggml_build_forward_expand(graph,output);
         auto allocator=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -153,7 +158,9 @@ int main() {
             cosine[t*64+d]=std::cos(angle);sine[t*64+d]=std::sin(angle);
         }
         // Traverse input tokens, then write the independently specified
-        // [component,batch,head,token,dimension] output layout.
+        // [component,batch,head,token,dimension] output layout, with V's
+        // token and dimension exchanged when transposed. Scaling follows
+        // ggml_scale, which adds a zero bias.
         for (int b=0;b<batches;++b) for (int t=0;t<length;++t)
             for (int component=0;component<3;++component) for (int h=0;h<heads;++h) for (int d=0;d<64;++d) {
                 const int src=((b*length+t)*3+component)*width+h*64+d;
@@ -164,8 +171,13 @@ int main() {
                     volatile float second=(d<32 ? -input[opposite] : input[opposite])*sine[t*64+d];
                     value=first+second;
                 }
-                const int dst=((((component*batches+b)*heads+h)*length+t)*64+d);
-                expected[dst]=rounded(value);
+                value=rounded(value);
+                if (component<2 && (layout&packed_scaled_qk)) {
+                    volatile float scaled=value*qk_scale;
+                    value=scaled+0.0f;
+                }
+                const int matrix=((component*batches+b)*heads+h)*length*64;
+                expected[matrix+(component==2 && (layout&packed_transposed_v) ? d*length+t : t*64+d)]=value;
             }
         ggml_backend_tensor_set(x,input.data(),0,ggml_nbytes(x));
         if (rotary) {
@@ -180,6 +192,74 @@ int main() {
         if (ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) laya::test::fail("QKV packing compute failed");
         ggml_backend_tensor_get(output,actual.data(),0,ggml_nbytes(output));
         if (actual!=expected) laya::test::fail("QKV packing did not round products on read");
+        ggml_gallocr_free(allocator);ggml_free(ctx);
+    }
+    // Attention heads merge into token rows with the rounding projection
+    // storage applies, including signed zero and ties.
+    for (ggml_type type : {GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_BF16}) {
+        constexpr int length=70,heads=3,batches=3,count=64*length*heads*batches;
+        auto ctx=ggml_init({8*ggml_tensor_overhead()+ggml_graph_overhead(),nullptr,true});
+        auto x=ggml_new_tensor_4d(ctx,GGML_TYPE_F32,64,length,heads,batches);
+        auto output=laya::vulkan_precision::merge_heads(ctx,x,type);
+        if (!ggml_backend_supports_op(backend,output)) laya::test::fail("Head merge unsupported");
+        auto graph=ggml_new_graph(ctx);ggml_build_forward_expand(graph,output);
+        auto allocator=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(allocator,graph)) laya::test::fail("Head merge allocation failed");
+        std::vector<float> input(count),expected(count),actual(count);
+        const float samples[]={0.0f,-0.0f,1.00048828125f,-1.00048828125f,1.00390625f,-1.00390625f,
+            0x1p-24f,-0x1p-24f,0x1p-25f,-0x1p-25f,0x1.ffcp+14f,-0x1.ffcp+14f};
+        for (int i=0;i<count;++i) input[i]=i%5 ? std::sin(float(i)*0.173f)*7.31f : samples[i/5%std::size(samples)];
+        for (int b=0;b<batches;++b) for (int h=0;h<heads;++h) for (int t=0;t<length;++t) for (int d=0;d<64;++d) {
+            float value=input[((b*heads+h)*length+t)*64+d];
+            if (type==GGML_TYPE_F16) value=ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
+            if (type==GGML_TYPE_BF16) value=ggml_bf16_to_fp32(ggml_fp32_to_bf16(value));
+            expected[((b*length+t)*heads+h)*64+d]=value;
+        }
+        ggml_backend_tensor_set(x,input.data(),0,ggml_nbytes(x));
+        if (ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) laya::test::fail("Head merge compute failed");
+        ggml_backend_tensor_get(output,actual.data(),0,ggml_nbytes(output));
+        if (std::memcmp(actual.data(),expected.data(),count*sizeof(float))!=0)
+            laya::test::fail("Head merge changed layout, rounding, or signed zero");
+        ggml_gallocr_free(allocator);ggml_free(ctx);
+    }
+    // Explicit attention over a scaled, transposed pack and merged heads
+    // reproduces scaling, transposing and permuting the plain pack.
+    for (bool amd : {false,true}) {
+        constexpr int length=70,heads=2,batches=2,width=64*heads,count=3*width*length*batches;
+        auto ctx=ggml_init({64*ggml_tensor_overhead()+ggml_graph_overhead(),nullptr,true});
+        auto x=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,3*width,length*batches);
+        auto attend=[&](int32_t layout) {
+            auto packed=laya::vulkan_precision::pack_qkv(ctx,x,nullptr,nullptr,length,batches,GGML_TYPE_F16,layout);
+            auto part=[&](int i,bool transposed) {
+                const int64_t row=transposed ? length : 64,rows=transposed ? 64 : length;
+                return ggml_view_4d(ctx,packed,row,rows,heads,batches,row*sizeof(float),packed->nb[2],packed->nb[3],
+                                    i*batches*packed->nb[3]);
+            };
+            auto q=part(0,false),k=part(1,false),v=part(2,layout&packed_transposed_v);
+            if (amd && !(layout&packed_scaled_qk)) q=ggml_scale(ctx,q,qk_scale),k=ggml_scale(ctx,k,qk_scale);
+            auto scores=ggml_mul_mat(ctx,k,q);
+            ggml_prec_set_acc(scores,GGML_PREC_F32);
+            auto probabilities=ggml_soft_max_ext(ctx,scores,nullptr,amd ? 1.0f : 0.125f,0);
+            if (!(layout&packed_transposed_v)) v=ggml_cont(ctx,ggml_transpose(ctx,v));
+            auto value=ggml_mul_mat(ctx,v,probabilities);
+            ggml_prec_set_acc(value,GGML_PREC_F32);
+            if (layout&packed_transposed_v) return laya::vulkan_precision::merge_heads(ctx,value,GGML_TYPE_F16);
+            value=ggml_reshape_2d(ctx,ggml_cont(ctx,ggml_permute(ctx,value,0,2,1,3)),width,length*batches);
+            return laya::vulkan_precision::finish_projection(ctx,value,nullptr,nullptr,GGML_TYPE_F16);
+        };
+        auto reference=attend(packed_plain);
+        auto output=attend(amd ? packed_scaled_qk|packed_transposed_v : packed_transposed_v);
+        auto graph=ggml_new_graph(ctx);ggml_build_forward_expand(graph,reference);ggml_build_forward_expand(graph,output);
+        auto allocator=ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(allocator,graph)) laya::test::fail("Fused attention allocation failed");
+        std::vector<float> input(count),expected(width*length*batches),actual(expected.size());
+        for (int i=0;i<count;++i) input[i]=std::sin(float(i)*0.0713f)*3.7f;
+        ggml_backend_tensor_set(x,input.data(),0,ggml_nbytes(x));
+        if (ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) laya::test::fail("Fused attention compute failed");
+        ggml_backend_tensor_get(reference,expected.data(),0,ggml_nbytes(reference));
+        ggml_backend_tensor_get(output,actual.data(),0,ggml_nbytes(output));
+        if (std::memcmp(actual.data(),expected.data(),expected.size()*sizeof(float))!=0)
+            laya::test::fail("Fused attention layouts changed attention output");
         ggml_gallocr_free(allocator);ggml_free(ctx);
     }
     for (bool rocm : {false,true}) {

@@ -1,0 +1,25 @@
+#version 450
+layout(local_size_x=256,local_size_y=1,local_size_z=1) in;
+layout(binding=0) readonly buffer Input { float x[]; };
+layout(binding=1) writeonly buffer Output { float y[]; };
+layout(push_constant) uniform Params { uint width,tokens,batches,flags; } p;
+#include "rounding.glsl"
+float stored(float value) {
+    uint format_code=p.flags&3u;
+    if (format_code==0u) return value;
+    if (format_code==1u) return unpackHalf2x16(halfBits(value)).x;
+    uint bits=floatBitsToUint(value);
+    if ((bits&0x7fffffffu)>0x7f800000u) return uintBitsToFloat(bits|0x00400000u);
+    return uintBitsToFloat((bits+0x7fffu+((bits>>16)&1u))&0xffff0000u);
+}
+// x is [dimension, token, head, sequence] with 64 dimensions per head; y has
+// one row of [head, dimension] per token. x is the output column, y the token
+// and z the sequence.
+void main() {
+    const uint column=gl_GlobalInvocationID.x;
+    if (column>=p.width) return;
+    const uint heads=p.width/64, head=column/64, d=column%64;
+    for (uint batch=gl_WorkGroupID.z;batch<p.batches;batch+=gl_NumWorkGroups.z)
+        for (uint token=gl_WorkGroupID.y;token<p.tokens;token+=gl_NumWorkGroups.y)
+            y[(batch*p.tokens+token)*p.width+column]=stored(x[((batch*heads+head)*p.tokens+token)*64+d]);
+}
